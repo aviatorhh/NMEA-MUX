@@ -27,7 +27,7 @@ extern char* __brkval;
 
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
 
-#define BUILD 924
+#define BUILD 990
 #define SD_CS 4
 #define PORTS 5
 #define P1 0
@@ -66,6 +66,7 @@ extern char* __brkval;
 #define MASK_ETH 0b11000010
 #define EMPTY_LINE 1
 
+#define NMEA_ZDA "ZDA"
 
 // Timer
 #define HZ 1     // Timer period in seconds
@@ -175,7 +176,6 @@ EthernetServer* server;  // Main server for NMEA connections
 uint8_t readStream(Stream& stream, uint8_t port_num);
 void sendStream(Stream& stream, uint8_t port_num, char* nmea_line);
 uint8_t checkChecksum(char* nmea_line);
-uint32_t hexStr2Int(char str[]);
 void sendFreeText(char* text);
 // uint8_t verifyFilter(uint8_t index);
 void printErrorMessage(uint8_t e, bool eol = true);
@@ -185,6 +185,7 @@ uint32_t crc32(File& file, uint32_t& charcnt);
 inline uint32_t updateCRC32(uint8_t ch, uint32_t crc);
 #ifdef WEB_GUI
 void printFilter(Stream& stream, Filter* filter);
+void parseNMEA(const char* nmea_line);
 void parseParameter(char* p);
 void str_replace(char* src, char* oldchars, char* newchars);
 #endif
@@ -216,9 +217,6 @@ uint16_t eeprom_crc() {
     return crc;
 }
 
-uint32_t hexStr2Int(char str[]) {
-    return (uint32_t)strtoul(str, 0, 16);
-}
 /**
  * Calculate free memory
  */
