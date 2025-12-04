@@ -10,7 +10,12 @@
 #include <ArduinoUniqueID.h>
 #endif
 #include <ArduinoMqttClient.h>
-
+#ifdef HAS_I2C_LCD
+#include <LiquidCrystal_I2C.h>
+#define COLS 20
+#define ROWS 4
+LiquidCrystal_I2C lcd(0x27, 2, 1, 0, 4, 5, 6, 7, 3, POSITIVE);
+#endif
 #include "utils.h"
 
 #ifdef WEB_GUI
@@ -60,6 +65,7 @@ int mqtt_port = 1883;
 char update_host[32];
 
 uint8_t admin_timeout;
+volatile uint8_t zda_out_counter;
 
 /**
  * Init the soft- and hardware.
@@ -77,6 +83,37 @@ void setup() {
     const uint32_t uid = ((uint32_t)UniqueID8[4] << 24) + ((uint32_t)UniqueID8[5] << 16) + ((uint32_t)UniqueID8[6] << 8) + UniqueID8[7];
 #endif
     wdt_enable(WDTO_8S);
+
+#ifdef HAS_I2C_LCD
+    // Initiate the LCD:
+    lcd.begin(COLS, ROWS);
+
+    /*   programCharIntoLCD(BACK_CHR, back_chr);
+      programCharIntoLCD(BAT_CHR, bat_chr);
+      programCharIntoLCD(C_CHR, c_chr);
+      programCharIntoLCD(T_CHR, t_chr);
+      programCharIntoLCD(F_CHR, f_chr); */
+
+    for (size_t i = 0; i < 2; i++) {
+        delay(250);
+        lcd.noBacklight();
+        delay(250);
+        lcd.backlight();
+    }
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print(F("NMEA MUX4s-1e "));
+    lcd.print(BUILD, DEC);
+    lcd.setCursor(0, 1);
+    lcd.write(0b01111110);  // ->
+    lcd.print(" 0");
+    lcd.setCursor(10, 1);
+    lcd.write(0b01111111);  // <-
+    lcd.print(" 0");
+    lcd.setCursor(0, 2);
+    lcd.print("IP:");
+#endif
 
 #ifdef DEBUG
 
@@ -570,6 +607,7 @@ void setup() {
 #ifndef DEBUG
     Serial.begin(p_config[P1].baud, p_config[P1].parameter);
 #endif
+    // Serial1.begin(4800, SERIAL_8N1);
     Serial1.begin(p_config[P2].baud, p_config[P2].parameter);
     Serial2.begin(p_config[P3].baud, p_config[P3].parameter);
     Serial3.begin(p_config[P4].baud, p_config[P4].parameter);
@@ -626,6 +664,12 @@ void setup() {
 #endif
 
 #ifdef ETHERNET
+#ifdef HAS_I2C_LCD
+    lcd.setCursor(4, 2);
+    // char buf[16];
+    IPAddress ipa = Ethernet.localIP();
+    ipa.printTo(lcd);
+#endif
 #ifdef WEB_GUI
 
     // EthernetClient c;
@@ -701,7 +745,9 @@ void setup() {
     char t[40];
     sprintf(t, "%s - MUX4s-1e started", hostname);
     sendFreeText(t);
-    send2All();
+    while (!fifo_is_empty(msgout_buf)) {
+        send2All();
+    }
 #ifdef DEBUG
     printsf("%s - MUX4s-1e started\r\n", hostname);
     UART0_Flush();
@@ -713,113 +759,8 @@ void setup() {
 
     // enable serial interrupts on Serial 1 for LED blinking
     UCSR0B |= _BV(TXCIE0);
-}
 
-/**
- * Send the buffer data to all ports.
- */
-void send2All() {
-    if (fifo_is_empty(msgout_buf)) {
-        return;
-    }
-
-    char nmea_line[NMEA_LINE_LENGTH];
-    fifo_get(msgout_buf, nmea_line);
-
-    if (matchFilter(nmea_line, &(p_config[P1].ofilter))) {
-        // Check if it has come from the same source. Avoid to echo if so.
-        if (nmea_line[0] & 0b11000010) {
-            uint8_t t = nmea_line[0];
-            nmea_line[0] &= 0b00111101;
-            led_on();
-#ifndef DEBUG            
-            sendStream(Serial, P1, nmea_line);
-#else
-            UART0_Println(nmea_line);
-#endif
-            // led_off();
-            nmea_line[0] = t;
-        }
-    }
-    if (matchFilter(nmea_line, &(p_config[P2].ofilter))) {
-        // Check if it has come from the same source. Avoid to echo if so.
-        if ((nmea_line[0] & 0b11000010) != 0b01000000) {
-            uint8_t t = nmea_line[0];
-            nmea_line[0] &= 0b00111101;
-            sendStream(Serial1, P2, nmea_line);
-            nmea_line[0] = t;
-        }
-    }
-    if (matchFilter(nmea_line, &(p_config[P3].ofilter))) {
-        // Check if it has come from the same source. Avoid to echo if so.
-        if ((nmea_line[0] & 0b11000010) != 0b10000000) {
-            uint8_t t = nmea_line[0];
-            nmea_line[0] &= 0b00111101;
-            sendStream(Serial2, P3, nmea_line);
-            nmea_line[0] = t;
-        }
-    }
-    if (matchFilter(nmea_line, &(p_config[P4].ofilter))) {
-        // Check if it has come from the same source. Avoid to echo if so.
-        if ((nmea_line[0] & 0b11000010) != 0b11000000) {
-            uint8_t t = nmea_line[0];
-            nmea_line[0] &= 0b00111101;
-            sendStream(Serial3, P4, nmea_line);
-            nmea_line[0] = t;
-        }
-    }
-#ifdef ETHERNET
-    // Is OUT active?
-    if (Ethernet.link() == 1) {
-        if ((p_config[PETH1].direction & OUT)) {
-            if (matchFilter(nmea_line, &(p_config[PETH1].ofilter))) {
-                // Check if it has come from the same source. Avoid to echo if so.
-                if ((nmea_line[0] & 0b11000010) != 0b000000010) {
-                    nmea_line[0] &= 0b00111101;
-                    const char* ptr = strchr(nmea_line, '\0');
-                    if (ptr) {
-                        int16_t j = ptr - nmea_line;
-                        server->write(nmea_line, j);
-                    } else {
-                        server->write(nmea_line, NMEA_LINE_LENGTH - 2);
-                    }
-                    // server.println("$GTEST*");
-                    server->write(crlf, 2);  // line break
-                    mesg_sent++;
-                }
-            }
-        }
-
-        if (mqttClient.connected()) {
-            char buf[48];
-            nmea_line[0] = '$';
-            struct nmea* result = extractNMEA(nmea_line);
-            if (strcmp(result->id, "NULL")) {
-                sprintf(buf, "vessels/self/nmea0183/%s/%s", hostname, result->id);
-                mqttClient.beginMessage(buf);
-                mqttClient.print(result->sentence);
-                mqttClient.endMessage();
-            }
-            free(result);
-            // mqttClient.stop();
-        }
-    }
-
-#endif
-    /**
-#ifdef SDC
-    if (debug && has_sd) {
-            nmea_out = SD.open(NMEA_OUT_FILE, FILE_WRITE);
-            nmea_buffer[i][0] &= 0b00111101;
-            sendStream(nmea_out, PETH1, i);
-            nmea_out.close();
-    }
-#endif
-*/
-}
-
-ISR(USART0_TX_vect) {
-    led_off();
+    static_send = true;
 }
 
 /**
@@ -855,12 +796,17 @@ void loop() {
     }
 
 #ifdef ETHERNET
+
     if (Ethernet.link() == 1) {
         EthernetClient client = server->available();  // returns first client which has data to read or a 'false' client
-        if (client) {                                 // client is true only if it is connected and has data to read
+        while (client) {                              // client is true only if it is connected and has data to read
             readStream(client, PETH1);
-            send2All();
+            while (!fifo_is_empty(msgout_buf)) {
+                send2All();
+            }
+            client = server->available();
         }
+
 #ifdef WEB_GUI
         /**
          * Only available the first 5 Minutes
@@ -1194,7 +1140,7 @@ void loop() {
                                 }
                                 client.println(F("</td></tr>\r\n</table>\r\n</div>"));
                             }
-                            wdt_reset();    // Needed here as reading the strings from flash takes some time
+                            wdt_reset();  // Needed here as reading the strings from flash takes some time
                             /**
                              * ETHERNET SETUP
                              */
@@ -1343,8 +1289,6 @@ void loop() {
                         break;
                     } else if (b_read < 3 && reset && !image && !update) {
                         client.print(F("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-cache, no-store, must-revalidate\r\nPragma: no-cache\r\nExpires: 0\r\nRefresh:10; url=/\r\nConnection: close\r\n\r\n<html lang='en'>\r\n<head>\r\n<meta charset='utf-8' />\r\n<meta name='viewport' content='width=device-width, initial-scale=1' />\r\n<title>MUX4s-1e Updater</title>\r\n<style>* {font-family: monospace;}</style>\r\n<body>Please wait. Page reloads after 10 seconds.</body></html>"));
-                        // client.flush();
-                        // client.stop();
                     }
                 }
             }
@@ -1359,9 +1303,10 @@ void loop() {
                     update = 0;
                     char t[] = "Updating Firmware";
                     sendFreeText(t);
-                    send2All();
+                    while (!fifo_is_empty(msgout_buf)) {
+                        send2All();
+                    }
                 }
-                // client.print((const __FlashStringHelper*)H2);
                 server->flush();
                 server1.flush();
                 free(server);
@@ -1371,20 +1316,12 @@ void loop() {
                 char t[40];
                 sprintf(t, "%s - Performing Reset", hostname);
                 sendFreeText(t);
-                send2All();
+                while (!fifo_is_empty(msgout_buf)) {
+                    send2All();
+                }
                 stop();
                 while (1);
             }
-
-            /* #ifndef DEBUG
-                        Serial.begin(p_config[P1].baud, p_config[P1].parameter);
-                        UCSR0B |= _BV(TXCIE0);
-            #endif
-                        Serial1.begin(p_config[P2].baud, p_config[P2].parameter);
-                        Serial2.begin(p_config[P3].baud, p_config[P3].parameter);
-                        Serial3.begin(p_config[P4].baud, p_config[P4].parameter); */
-
-            // wdt_enable(WDTO_8S);
         }
 #endif
     }
@@ -1407,11 +1344,32 @@ void loop() {
                 connectMQTT(mqtt_broker, mqtt_port);
             }
         }
+
+#ifdef HAS_I2C_LCD
+        lcd.setCursor(19, 0);
+
+        if ((uptime - uptime_admin) < 60 * ADMIN_TIMEOUT) {
+            lcd.write('*');
+        } else {
+            lcd.write(' ');
+        }
+
+        lcd.setCursor(4, 2);
+        lcd.print(Ethernet.localIP());
+        lcd.write(' ');
+
+    if (zda_out_counter > 4) {
+        lcd.setCursor(0, 3);
+        lcd.print(F("no ZDA              "));
+        zda_out_counter = 5;
+    }
+#endif
+
 #endif
         static_send = false;
     }
 
-    // Send out all messages
+    // Send out all messages left
     while (!fifo_is_empty(msgout_buf)) {
         send2All();
     }
@@ -1423,6 +1381,117 @@ void loop() {
     } else {
         PORTB &= ~_BV(BUILTIN_LED);
     }
+}
+
+/**
+ * Send the buffer data to all ports.
+ */
+void send2All() {
+    if (fifo_is_empty(msgout_buf)) {
+        return;
+    }
+
+    char nmea_line[NMEA_LINE_LENGTH];
+    fifo_get(msgout_buf, nmea_line);
+
+    if (matchFilter(nmea_line, &(p_config[P1].ofilter))) {
+        // Check if it has come from the same source. Avoid to echo if so.
+        if (nmea_line[0] & 0b11000010) {
+            uint8_t t = nmea_line[0];
+            nmea_line[0] &= 0b00111101;
+            led_on();
+#ifndef DEBUG
+            sendStream(Serial, P1, nmea_line);
+#else
+            UART0_Println(nmea_line);
+#endif
+            // led_off();
+            nmea_line[0] = t;
+        }
+    }
+    if (matchFilter(nmea_line, &(p_config[P2].ofilter))) {
+        // Check if it has come from the same source. Avoid to echo if so.
+        if ((nmea_line[0] & 0b11000010) != 0b01000000) {
+            uint8_t t = nmea_line[0];
+            nmea_line[0] &= 0b00111101;
+            sendStream(Serial1, P2, nmea_line);
+            nmea_line[0] = t;
+        }
+    }
+    if (matchFilter(nmea_line, &(p_config[P3].ofilter))) {
+        // Check if it has come from the same source. Avoid to echo if so.
+        if ((nmea_line[0] & 0b11000010) != 0b10000000) {
+            uint8_t t = nmea_line[0];
+            nmea_line[0] &= 0b00111101;
+            sendStream(Serial2, P3, nmea_line);
+            nmea_line[0] = t;
+        }
+    }
+    if (matchFilter(nmea_line, &(p_config[P4].ofilter))) {
+        // Check if it has come from the same source. Avoid to echo if so.
+        if ((nmea_line[0] & 0b11000010) != 0b11000000) {
+            uint8_t t = nmea_line[0];
+            nmea_line[0] &= 0b00111101;
+            sendStream(Serial3, P4, nmea_line);
+            nmea_line[0] = t;
+        }
+    }
+#ifdef ETHERNET
+    // Is OUT active?
+    if (Ethernet.link() == 1) {
+        if ((p_config[PETH1].direction & OUT)) {
+            if (matchFilter(nmea_line, &(p_config[PETH1].ofilter))) {
+                // Check if it has come from the same source. Avoid to echo if so.
+                if ((nmea_line[0] & 0b11000010) != 0b000000010) {
+                    nmea_line[0] &= 0b00111101;
+                    const char* ptr = strchr(nmea_line, '\0');
+                    if (ptr) {
+                        int16_t j = ptr - nmea_line;
+                        server->write(nmea_line, j);
+                    } else {
+                        server->write(nmea_line, NMEA_LINE_LENGTH - 2);
+                    }
+                    // server.println("$GTEST*");
+                    server->write(crlf, 2);  // line break
+                    mesg_sent++;
+#ifdef HAS_I2C_LCD
+                    lcd.setCursor(12, 1);
+                    lcd.print(mesg_sent, DEC);
+#endif
+                }
+            }
+        }
+
+        if (mqttClient.connected()) {
+            char buf[48];
+            nmea_line[0] = '$';
+            struct nmea* result = extractNMEA(nmea_line);
+            if (strcmp(result->id, "NULL")) {
+                sprintf(buf, "vessels/self/nmea0183/%s/%s", hostname, result->id);
+                mqttClient.beginMessage(buf);
+                mqttClient.print(result->sentence);
+                mqttClient.endMessage();
+            }
+            free(result);
+            // mqttClient.stop();
+        }
+    }
+
+#endif
+    /**
+#ifdef SDC
+    if (debug && has_sd) {
+            nmea_out = SD.open(NMEA_OUT_FILE, FILE_WRITE);
+            nmea_buffer[i][0] &= 0b00111101;
+            sendStream(nmea_out, PETH1, i);
+            nmea_out.close();
+    }
+#endif
+*/
+}
+
+ISR(USART0_TX_vect) {
+    led_off();
 }
 
 struct nmea* extractNMEA(char* nmea_line) {
@@ -1451,6 +1520,7 @@ struct nmea* extractNMEA(char* nmea_line) {
  */
 ISR(TIMER1_COMPA_vect) {
     uptime++;
+    zda_out_counter++;
     if (!(uptime % 05)) {
         static_send = true;
     }
@@ -1469,21 +1539,21 @@ uint8_t readStream(Stream& stream, uint8_t port_num) {
     }
 
     // We have three conditions for a "full" read
-    // 1. bytes available less then MAX
+    // 1. bytes available less then NMEA_LINE_LENGTH
     // 2. '\n' in read buffer
-    // 3. bytes do not contain '\n' (or '\r') but equals MAX
+    // 3. bytes do not contain '\n' (or '\r') but equals NMEA_LINE_LENGTH
 
     // Case 1. normal read
     // Case 2. check for '\n' ('\r')
     // Case 3. continue read with next buffer (but not if then full)
 
-    uint8_t b_read = 0;
+    int8_t b_read = 0;
     while (stream.available()) {
         // There is something that wants to be read
 
         b_read = stream.readBytesUntil('\n', nmea_line, NMEA_LINE_LENGTH);
 
-        if (!b_read) {
+        if (b_read < 1) {
             continue;
         }
 
@@ -1493,6 +1563,8 @@ uint8_t readStream(Stream& stream, uint8_t port_num) {
             if (!matchFilter(nmea_line, &(p_config[port_num].ifilter)) || !checkChecksum(nmea_line)) {
                 continue;
             }
+
+            parseNMEA(nmea_line);
 
             /**
              *  We are setting a mark/mask to avoid sending back the traffic from where it arrives (see send2All())
@@ -1519,7 +1591,6 @@ uint8_t readStream(Stream& stream, uint8_t port_num) {
                     nmea_line[0] |= 0b00000010;
                     break;
             }
-
 #ifdef TRANSLATE
 
             // Get the sentence identifier
@@ -1530,6 +1601,10 @@ uint8_t readStream(Stream& stream, uint8_t port_num) {
                 // Store the original message as it will be changed bleow
                 fifo_add(msgout_buf, nmea_line);
                 mesg_recv++;  // got one more
+#ifdef HAS_I2C_LCD
+                lcd.setCursor(2, 1);
+                lcd.print(mesg_recv, DEC);
+#endif
 
                 // store the input port check character
                 char check = nmea_line[0];
@@ -1587,9 +1662,18 @@ uint8_t readStream(Stream& stream, uint8_t port_num) {
                     index--;
                     break;
             } */
-            fifo_add(msgout_buf, nmea_line);
-            mesg_recv++;
+            if (fifo_add(msgout_buf, nmea_line)) {
+                mesg_recv++;
+            }
+#ifdef HAS_I2C_LCD
+            lcd.setCursor(2, 1);
+            lcd.print(mesg_recv, DEC);
+#endif
             continue;
+        } else {
+            // No valid line rexeived
+            read = 0;
+            break;
         }
     }
     // Flush
@@ -1619,6 +1703,10 @@ void sendStream(Stream& stream, uint8_t port_num, char* nmea_line) {
         stream.write(nmea_line, NMEA_LINE_LENGTH);
     }
     mesg_sent++;
+#ifdef HAS_I2C_LCD
+    lcd.setCursor(12, 1);
+    lcd.print(mesg_sent, DEC);
+#endif
 }
 
 /**
@@ -1781,6 +1869,74 @@ void printFilter(Stream& stream, Filter* filter) {
         stream.write(':');
     }
 }
+
+void parseNMEA(const char* nmea_line) {
+    // Get the sentence identifier
+    if (nmea_line[0] != '$' && nmea_line[0] != '!')
+        return;
+    if (!checkChecksum((const char*)nmea_line))
+        return;
+    char id[4];  // The NMEA0183 sentence name
+    id[3] = 0;   // zero for a char array
+    strncpy(id, nmea_line + 3, 3);
+
+    // this is a comma separated item within
+    // char* token = (char*)malloc(NMEA_LINE_LENGTH);
+    /* get the first token */
+    // const char s[2] = ",";
+    // char* copy = (char*)malloc(sizeof(nmea_line));
+    // strcpy(copy, nmea_line);
+    char* tempstr = strdup(nmea_line);
+    char* token = strtok(tempstr, ",");
+
+    /* walk through other tokens */
+    uint8_t i = 1;
+
+    if (!strcmp(id, NMEA_ZDA)) {
+        zda_out_counter = 0;
+        uint8_t hh;
+        uint8_t mm;
+        uint8_t ss;
+        uint8_t dd;
+        uint8_t mt;
+        uint16_t yr;
+        char buf[10];
+        while (token != NULL) {
+            token = strtok(NULL, ",");  // special case, NULL means next one
+            switch (i) {
+                case 1:
+                    hh = atoi(strncpy(id, token, 2));
+                    mm = atoi(strncpy(id, token + 2, 2));
+                    ss = atoi(strncpy(id, token + 4, 2));
+#ifdef HAS_I2C_LCD
+                    lcd.setCursor(0, 3);
+                    sprintf(buf, "%02u:%02u:%02uz", hh, mm, ss);
+                    lcd.print(buf);
+#endif
+                    break;
+                case 2:
+                    dd = atoi(token);
+                    break;
+                case 3:
+                    mt = atoi(token);
+                    break;
+                case 4:
+                    yr = atoi(token);
+#ifdef HAS_I2C_LCD
+                    // lcd.setCursor(9, 3);
+                    sprintf(buf, " %02u.%02u.%u", dd, mt, yr);
+                    lcd.print(buf);
+#endif
+                    token = NULL;
+                    break;
+            }
+
+            i++;
+        }
+    }
+    free(tempstr);
+}
+
 void parseParameter(char* p) {
     // index search
     int8_t i = -1;
@@ -1899,11 +2055,11 @@ void parseParameter(char* p) {
     /**
      * IP Address
      */
+    IPAddress ip;
     if (!strncmp(t, "ip_add", 6)) {
         if (!(i - k)) {
             ip_address[0] = ip_address[1] = ip_address[2] = ip_address[3] = 0;
         } else {
-            IPAddress ip;
             ip.fromString(v);
             ip_address[0] = ip[0];
             ip_address[1] = ip[1];
@@ -1916,7 +2072,6 @@ void parseParameter(char* p) {
         if (!(i - k)) {
             dns_a[0] = dns_a[1] = dns_a[2] = dns_a[3] = 0;
         } else {
-            IPAddress ip;
             ip.fromString(v);
             dns_a[0] = ip[0];
             dns_a[1] = ip[1];
@@ -1927,7 +2082,6 @@ void parseParameter(char* p) {
         if (!(i - k)) {
             gateway[0] = gateway[1] = gateway[2] = gateway[3] = 0;
         } else {
-            IPAddress ip;
             ip.fromString(v);
             gateway[0] = ip[0];
             gateway[1] = ip[1];
@@ -1940,7 +2094,6 @@ void parseParameter(char* p) {
         if (!(i - k)) {
             subnet[0] = subnet[1] = subnet[2] = subnet[3] = 0;
         } else {
-            IPAddress ip;
             ip.fromString(v);
             subnet[0] = ip[0];
             subnet[1] = ip[1];
