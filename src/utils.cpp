@@ -1,7 +1,23 @@
 #include "utils.h"
 
-#include <string.h>
 #include <stdlib.h>
+#include <string.h>
+
+char* next_field(char** p) {
+    if (*p == NULL) return NULL;
+
+    char* start = *p;
+    char* comma = strchr(start, ',');
+
+    if (comma) {
+        *comma = '\0';
+        *p = comma + 1;
+    } else {
+        *p = NULL;
+    }
+
+    return start;
+}
 
 /**
  *
@@ -17,6 +33,40 @@ uint8_t calcChecksum(const char* sentence) {
         }
     }
     return xsum;
+}
+char* trim(char* string) {
+    char* ptr = NULL;
+    while (*string == ' ') string++;    // chomp away space at the start
+    ptr = string + strlen(string) - 1;  // jump to the last char (-1 because '\0')
+    while (*ptr == ' ') {
+        *ptr = '\0';
+        ptr--;
+    };              // overwrite with end of string
+    return string;  // return pointer to the modified start
+}
+uint8_t checkChecksum(char* nmea_line) {
+    if ((nmea_line[0] & '$') != '$' && nmea_line[0] != '!') {
+        return 0;
+    }
+
+    uint8_t cs = calcChecksum(nmea_line);
+
+    // Get the checksum characters
+    char t[3];
+    const char* ptr = strchr(nmea_line, '*');
+    if (ptr) {
+        int16_t i = ptr - nmea_line;
+        t[0] = nmea_line[i + 1];
+        t[1] = nmea_line[i + 2];
+        t[2] = '\0';
+        if (cs != hexStr2Int(t)) {
+            return 0;
+        }
+    } else {
+        return 0;
+    }
+
+    return 1;
 }
 
 uint32_t hexStr2Int(char str[]) { return (uint32_t)strtoul(str, 0, 16); }

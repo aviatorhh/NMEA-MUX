@@ -6,7 +6,7 @@
 #include <avr/pgmspace.h>
 #include <avr/wdt.h>
 #include <string.h>
-#if defined(__AVR_ATmega328P__)
+#ifdef __AVR_ATmega328P__
 #include <ArduinoUniqueID.h>
 #endif
 #include <ArduinoMqttClient.h>
@@ -20,6 +20,72 @@ LiquidCrystal_I2C lcd(0x27, 2, 1, 0, 4, 5, 6, 7, 3, POSITIVE);
 
 #ifdef WEB_GUI
 EthernetServer server1(80);
+#endif
+
+/* ---------------- */
+float lat, lon;
+gga_t gga;
+volatile uint32_t epoch = 0;
+uint8_t valid_sats = 0;
+#ifdef DGPS
+typedef struct {
+    uint8_t prn;
+
+    float corr;
+    float az;
+    float el;
+    float snr;
+
+    uint32_t t_corr;  // last BRD09 update (ms)
+    uint32_t t_gsv;   // last GSV update (ms)
+
+    uint8_t has_corr;
+    uint8_t has_gsv;
+    uint8_t valid;
+} sat_t;
+
+#define MAX_SATS 32
+static sat_t sats[MAX_SATS];
+static float current_lat = 0.0;
+static float current_lon = 0.0;
+
+#define WGS84_A 6378137.0f
+#define WGS84_F 1.0f / 298.257223563f
+#define WGS84_E2 (WGS84_F * (2.0f - WGS84_F))
+float ref_lat, ref_lon, ref_alt;
+static uint16_t dgps_station_id = 0;
+static float dgps_time_s = 0.0;
+static float dgps_ref_x = 0.0;
+static float dgps_ref_y = 0.0;
+static float dgps_ref_z = 0.0;
+static uint8_t dgps_ref_valid = 0;
+static uint32_t dgps_ref_timestamp = 0;
+
+typedef struct {
+    float lat, lon;
+    float p_lat, p_lon;
+    uint8_t init;
+} kf_t;
+
+static kf_t kf;
+
+#define MAX_SIGNALS 6
+
+typedef struct {
+    const char* name;
+    float value;
+    float weight;
+    float contribution;
+} spoof_signal_t;
+
+typedef struct {
+    spoof_signal_t s[MAX_SIGNALS];
+    uint8_t count;
+    float total;
+    float max;
+} spoof_score_t;
+
+static spoof_score_t sp;
 #endif
 
 fifo_t msgout_buf;
@@ -111,8 +177,8 @@ void setup() {
     lcd.setCursor(10, 1);
     lcd.write(0b01111111);  // <-
     lcd.print(" 0");
-    lcd.setCursor(0, 2);
-    lcd.print("IP:");
+    // lcd.setCursor(0, 2);
+    // lcd.print("IP:");
 #endif
 
 #ifdef DEBUG
@@ -665,7 +731,7 @@ void setup() {
 
 #ifdef ETHERNET
 #ifdef HAS_I2C_LCD
-    lcd.setCursor(4, 2);
+    lcd.setCursor(0, 2);
     // char buf[16];
     IPAddress ipa = Ethernet.localIP();
     ipa.printTo(lcd);
@@ -1346,23 +1412,23 @@ void loop() {
         }
 
 #ifdef HAS_I2C_LCD
-        lcd.setCursor(19, 0);
+        /* lcd.setCursor(19, 0);
 
         if ((uptime - uptime_admin) < 60 * ADMIN_TIMEOUT) {
             lcd.write('*');
         } else {
             lcd.write(' ');
-        }
+        } */
 
-        lcd.setCursor(4, 2);
+        lcd.setCursor(0, 2);
         lcd.print(Ethernet.localIP());
         lcd.write(' ');
 
-    if (zda_out_counter > 4) {
         lcd.setCursor(0, 3);
-        lcd.print(F("no ZDA              "));
-        zda_out_counter = 5;
-    }
+        if (zda_out_counter > 4) {
+            lcd.print(F("no ZDA              "));
+            zda_out_counter = 5;
+        }
 #endif
 
 #endif
@@ -1520,23 +1586,51 @@ struct nmea* extractNMEA(char* nmea_line) {
  */
 ISR(TIMER1_COMPA_vect) {
     uptime++;
+    epoch++;  // increments every second
     zda_out_counter++;
     if (!(uptime % 05)) {
         static_send = true;
     }
 }
+#define SAT_TIMEOUT 3   // seconds
+#define CORR_TIMEOUT 3  // seconds
+uint32_t now(void) {
+    return epoch;
+}
+void update_sat_validity(void) {
+    uint32_t t = now();
 
+    for (int i = 0; i < MAX_SATS; i++) {
+        sat_t* s = &sats[i];
+
+        s->valid = 0;
+
+        if (!s->has_gsv)
+            continue;
+
+        if ((t - s->t_gsv) > SAT_TIMEOUT)
+            continue;
+
+        if (s->snr < 8)
+            continue;
+
+        if (s->el < 3)
+            continue;
+
+        s->valid = 1;
+    }
+}
 /**
  * Read the bytes from a stream
  */
 uint8_t readStream(Stream& stream, uint8_t port_num) {
-    uint8_t read = 0;
-    char nmea_line[NMEA_LINE_LENGTH];
-
     // Is IN active or buffer full
     if (!(p_config[port_num].direction & IN) || fifo_is_full(msgout_buf)) {
         return 0;
     }
+
+    // uint8_t read = 0;
+    char nmea_line[NMEA_LINE_LENGTH];
 
     // We have three conditions for a "full" read
     // 1. bytes available less then NMEA_LINE_LENGTH
@@ -1552,7 +1646,6 @@ uint8_t readStream(Stream& stream, uint8_t port_num) {
         // There is something that wants to be read
 
         b_read = stream.readBytesUntil('\n', nmea_line, NMEA_LINE_LENGTH);
-
         if (b_read < 1) {
             continue;
         }
@@ -1672,13 +1765,13 @@ uint8_t readStream(Stream& stream, uint8_t port_num) {
             continue;
         } else {
             // No valid line rexeived
-            read = 0;
+            b_read = 0;
             break;
         }
     }
     // Flush
     while (stream.read() > -1);
-    return read;
+    return b_read;
 }
 
 /**
@@ -1732,31 +1825,6 @@ uint8_t matchFilter(const char* nmea_line, Filter* filter) {
         }
     }
     return filter->pm_all;
-}
-
-uint8_t checkChecksum(char* nmea_line) {
-    if ((nmea_line[0] & '$') != '$' && nmea_line[0] != '!') {
-        return 0;
-    }
-
-    uint8_t cs = calcChecksum(nmea_line);
-
-    // Get the checksum characters
-    char t[3];
-    const char* ptr = strchr(nmea_line, '*');
-    if (ptr) {
-        int16_t i = ptr - nmea_line;
-        t[0] = nmea_line[i + 1];
-        t[1] = nmea_line[i + 2];
-        t[2] = '\0';
-        if (cs != hexStr2Int(t)) {
-            return 0;
-        }
-    } else {
-        return 0;
-    }
-
-    return 1;
 }
 
 /**
@@ -1869,72 +1937,692 @@ void printFilter(Stream& stream, Filter* filter) {
         stream.write(':');
     }
 }
+#ifdef DGPS
+void sp_init(spoof_score_t* sp) {
+    sp->count = 0;
+    sp->total = 0.0f;
+    sp->max = 0.0f;
+}
+
+void sp_add(spoof_score_t* sp, const char* name, float value, float weight) {
+    if (sp->count >= MAX_SIGNALS) return;
+
+    if (value < 0) value = 0;
+    if (value > 1) value = 1;
+
+    spoof_signal_t* sig = &sp->s[sp->count++];
+    sig->name = name;
+    sig->value = value;
+    sig->weight = weight;
+    sig->contribution = value * weight;
+
+    sp->total += sig->contribution;
+    sp->max += weight;
+}
+
+float sp_final(spoof_score_t* sp) {
+    if (sp->max < 0.0001f) return 0.0f;
+    return sp->total / sp->max;
+}
+
+/* ================= SAT MANAGEMENT ================= */
+
+sat_t* get_sat(uint8_t prn) {
+    for (int i = 0; i < MAX_SATS; i++) {
+        if (sats[i].prn == prn)
+            return &sats[i];
+    }
+
+    // allocate empty slot
+    for (int i = 0; i < MAX_SATS; i++) {
+        if (sats[i].prn == 0) {
+            sats[i].prn = prn;
+            return &sats[i];
+        }
+    }
+
+    return NULL;
+}
+void ecef_to_llh(float x, float y, float z,
+                 float* lat, float* lon, float* alt) {
+    float lon_r = atan2f(y, x);
+
+    float p = sqrtf(x * x + y * y);
+
+    float lat_r = atan2f(z, p * (1.0f - WGS84_E2));
+
+    float prev_lat;
+
+    // iterative refinement (2–3 iterations is enough)
+    for (int i = 0; i < 3; i++) {
+        float sin_lat = sinf(lat_r);
+        float N = WGS84_A / sqrtf(1.0f - WGS84_E2 * sin_lat * sin_lat);
+
+        prev_lat = lat_r;
+        lat_r = atan2f(z + WGS84_E2 * N * sin_lat, p);
+
+        if (fabsf(lat_r - prev_lat) < 1e-10f)
+            break;
+    }
+
+    float sin_lat = sinf(lat_r);
+    float N = WGS84_A / sqrtf(1.0f - WGS84_E2 * sin_lat * sin_lat);
+
+    *alt = p / cosf(lat_r) - N;
+    *lat = lat_r * 180.0f / M_PI;
+    *lon = lon_r * 180.0f / M_PI;
+}
+/* ================= PARSERS ================= */
+void parse_brd03(char* local) {
+    char* p = local;
+    char* f;
+    int field = 0;
+
+    char status = 'V';
+    uint16_t station_id = 0;
+    float time_s = 0;
+
+    float x = 0, y = 0, z = 0;
+
+    while ((f = next_field(&p))) {
+        field++;
+
+        if (field == 2) {
+            status = f[0];
+        } else if (field == 3) {
+            station_id = (uint16_t)atoi(f);
+        } else if (field == 4) {
+            time_s = atof(f);
+        } else if (field == 6) {
+            x = atof(f);
+        } else if (field == 7) {
+            y = atof(f);
+        } else if (field == 8) {
+            z = atof(f);
+        }
+    }
+
+    if (status != 'A')
+        return;
+
+    // store globally
+    dgps_station_id = station_id;
+    dgps_time_s = time_s;
+
+    dgps_ref_x = x;
+    dgps_ref_y = y;
+    dgps_ref_z = z;
+
+    dgps_ref_valid = 1;
+    dgps_ref_timestamp = now();
+}
+void parse_brd09(char* local) {
+    /*     char local[NMEA_LINE_LENGTH];
+        strncpy(local, line, NMEA_LINE_LENGTH);
+        local[NMEA_LINE_LENGTH - 1] = '\0'; */
+
+    char* p = local;
+    char* f;
+    int field = 0;
+
+    uint8_t prn = 0;
+    float corr = 0.0f;
+    float az = 0.0f;
+
+    while ((f = next_field(&p))) {
+        field++;
+
+        if (field == 6)
+            prn = (uint8_t)atoi(f);
+        else if (field == 7)
+            corr = atof(f);
+        else if (field == 9)
+            az = atof(f);
+    }
+
+    sat_t* s = get_sat(prn);
+    if (s) {
+        float alpha = 0.2f;  // smoothing factor
+
+        s->corr = (1.0f - alpha) * s->corr + alpha * corr;
+        s->az = az;
+        s->t_corr = now();
+        s->has_corr = 1;
+    }
+}
+
+static uint8_t gsv_cycle_complete = 0;
+static uint8_t gsv_total = 0;
+static uint8_t gsv_seen = 0;
+static uint8_t gsv_mask = 0;
+static uint8_t gsv_msg = 0;
+static uint8_t gsv_last_cycle = 0;
+
+void parse_gsv(char* local) {
+    char* p = local;
+    char* f;
+    int field = 0;
+
+    uint8_t prn = 0;
+
+    while ((f = next_field(&p))) {
+        field++;
+
+        // --- GSV header ---
+        if (field == 2) {
+            gsv_total = atoi(f);
+
+            // new cycle starts → reset tracking
+            if (gsv_total > 0 && gsv_msg == 1) {
+                gsv_mask = 0;
+                gsv_seen = 0;
+            }
+        } else if (field == 3) {
+            gsv_msg = atoi(f);
+        }
+
+        // --- Satellite blocks start at field 5 ---
+        else if (field >= 5) {
+            int offset = (field - 5) % 4;
+
+            if (offset == 0) {
+                // PRN
+                prn = (uint8_t)atoi(f);
+            } else {
+                sat_t* s = get_sat(prn);
+                if (!s) continue;
+
+                if (offset == 1) {
+                    // Elevation
+                    s->el = atof(f);
+                } else if (offset == 2) {
+                    // Azimuth
+                    s->az = atof(f);
+                } else if (offset == 3) {
+                    // SNR
+                    if (f[0] != '\0')
+                        s->snr = atof(f);
+                    else
+                        s->snr = 0.0f;
+
+                    // IMPORTANT:
+                    // Do NOT set valid or has_gsv here
+                    // Just timestamp raw reception
+                    s->t_gsv = now();
+                }
+            }
+        }
+    }
+    if (gsv_total > 0 && gsv_msg > 0 && gsv_msg <= 8) {
+        gsv_mask |= (1 << (gsv_msg - 1));
+        gsv_seen++;
+    }
+
+    uint8_t expected = (1 << gsv_total) - 1;
+
+    if (gsv_mask == expected) {
+        gsv_cycle_complete = 1;
+    }
+}
+void finalize_gsv_cycle(void) {
+    if (!gsv_cycle_complete)
+        return;
+
+    for (int i = 0; i < MAX_SATS; i++) {
+        if (sats[i].snr > 0) {
+            sats[i].has_gsv = 1;
+            sats[i].t_gsv = now();
+        }
+    }
+
+    gsv_cycle_complete = 0;
+
+    // reset cycle tracking
+    gsv_total = 0;
+    gsv_msg = 0;
+#ifdef DEBUG
+    UART0_Println("GSV cycle complete");
+#endif
+}
+void parse_gga(char* local) {
+    /*     char local[NMEA_LINE_LENGTH];
+        strncpy(local, line, NMEA_LINE_LENGTH);
+        local[NMEA_LINE_LENGTH - 1] = '\0'; */
+
+    char* p = local;
+    char* f;
+    int field = 0;
+
+    float lat = 0.0f, lon = 0.0f;
+    char ns = 'N', ew = 'E';
+
+    while ((f = next_field(&p))) {
+        field++;
+        if (field == 2) {
+            strncpy(gga.time, f, 10);
+        }
+        if (field == 3)
+            lat = atof(f);
+        else if (field == 4)
+            ns = f[0];
+        else if (field == 5)
+            lon = atof(f);
+        else if (field == 6)
+            ew = f[0];
+        else if (field == 7)
+            gga.fix_quality = atoi(f);
+        else if (field == 8)
+            gga.num_satellites = atoi(f);
+        else if (field == 9)
+            gga.horizontal_dilution = atof(f);
+        else if (field == 10)
+            gga.altitude = atof(f);
+        else if (field == 11)
+            gga.altitude_units = f[0];
+        else if (field == 12)
+            gga.undulation = atof(f);
+        else if (field == 13)
+            gga.undulation_units = f[0];
+        else if (field == 14)
+            gga.dgps_age = atof(f);
+        // else if (field == 15)
+        //     strncpy(gga.dgps_station_id, f, 6);
+    }
+
+    int lat_d = (int)(lat / 100);
+    float lat_m = lat - lat_d * 100;
+    current_lat = lat_d + lat_m / 60.0f;
+
+    int lon_d = (int)(lon / 100);
+    float lon_m = lon - lon_d * 100;
+    current_lon = lon_d + lon_m / 60.0f;
+
+    if (ns == 'S') current_lat = -current_lat;
+    if (ew == 'W') current_lon = -current_lon;
+}
+static float deg2rad(float d) {
+    return d * M_PI / 180.0f;
+}
+float nmea_to_deg(float nmea) {
+    int deg = (int)(nmea / 100);
+    float min = nmea - (deg * 100);
+    return deg + (min / 60.0f);
+}
+
+static uint8_t solve_lsq(float* dE, float* dN) {
+    float HtH[3][3] = {0};
+    float HtV[3] = {0};
+
+    uint8_t count = 0;
+
+    for (int i = 0; i < MAX_SATS; i++) {
+        sat_t* s = &sats[i];
+
+        if (!s->valid) continue;
+        if (s->snr < 8) continue;
+        if (s->el < 3) continue;
+        if (s->corr < -20 || s->corr > 20) continue;
+
+        float az = deg2rad(s->az);
+        float el = deg2rad(s->el);
+
+        float uE = cosf(el) * sinf(az);
+        float uN = cosf(el) * cosf(az);
+
+        float H[3] = {uE, uN, 1.0f};
+        float v = s->corr;
+
+        float w = (s->snr / 50.0f);
+
+        for (int r = 0; r < 3; r++) {
+            for (int c = 0; c < 3; c++) {
+                HtH[r][c] += H[r] * H[c] * w;
+            }
+            HtV[r] += H[r] * v * w;
+        }
+
+        count++;
+    }
+
+    if (count < 4)
+        return 0;
+
+    // --- solve ---
+    float A[3][4] = {
+        {HtH[0][0], HtH[0][1], HtH[0][2], HtV[0]},
+        {HtH[1][0], HtH[1][1], HtH[1][2], HtV[1]},
+        {HtH[2][0], HtH[2][1], HtH[2][2], HtV[2]}};
+
+    for (int i = 0; i < 3; i++) {
+        float pivot = A[i][i];
+        if (fabsf(pivot) < 1e-6f)
+            return 0;
+
+        for (int j = i; j < 4; j++)
+            A[i][j] /= pivot;
+
+        for (int k = 0; k < 3; k++) {
+            if (k == i) continue;
+            float f = A[k][i];
+            for (int j = i; j < 4; j++)
+                A[k][j] -= f * A[i][j];
+        }
+    }
+
+    *dE = A[0][3];
+    *dN = A[1][3];
+
+    return 1;
+}
+
+float cx = 0, cy = 0;
+void compute_corrected(float* lat_out, float* lon_out) {
+    float lat = current_lat;
+    float lon = current_lon;
+
+    float dE = 0, dN = 0;
+
+    // --- PASS 1 ---
+    if (!solve_lsq(&dE, &dN)) {
+        *lat_out = lat;
+        *lon_out = lon;
+        return;
+    }
+
+    // --- OUTLIER REJECTION (THIS IS POINT 3) ---
+    for (int i = 0; i < MAX_SATS; i++) {
+        sat_t* s = &sats[i];
+        if (!s->valid) continue;
+
+        float az = deg2rad(s->az);
+        float el = deg2rad(s->el);
+
+        float uE = cosf(el) * sinf(az);
+        float uN = cosf(el) * cosf(az);
+
+        float predicted = uE * dE + uN * dN;
+        float residual = s->corr - predicted;
+
+        if (fabsf(residual) > 5.0f) {
+            s->valid = 0;  // 🚨 reject bad satellite
+        }
+    }
+
+    // --- PASS 2 (clean solution) ---
+    if (!solve_lsq(&dE, &dN)) {
+        *lat_out = lat;
+        *lon_out = lon;
+        return;
+    }
+
+    // --- APPLY ---
+    lat += dN / 111320.0f;
+    lon += dE / (111320.0f * cosf(deg2rad(lat)));
+
+    *lat_out = lat;
+    *lon_out = lon;
+}
+/* ================= KALMAN ================= */
+
+void kf_update(float lat, float lon) {
+    if (!kf.init) {
+        kf.lat = lat;
+        kf.lon = lon;
+        kf.p_lat = kf.p_lon = 1.0f;
+        kf.init = 1;
+        return;
+    }
+
+    float q = 1e-5f;
+    float r = 1e-4f;
+
+    kf.p_lat += q;
+    kf.p_lon += q;
+
+    float k_lat = kf.p_lat / (kf.p_lat + r);
+    float k_lon = kf.p_lon / (kf.p_lon + r);
+
+    kf.lat += k_lat * (lat - kf.lat);
+    kf.lon += k_lon * (lon - kf.lon);
+
+    kf.p_lat *= (1.0f - k_lat);
+    kf.p_lon *= (1.0f - k_lon);
+}
+#endif
+int count_valid_sats(void) {
+    int n = 0;
+
+    for (int i = 0; i < MAX_SATS; i++) {
+        sat_t* s = &sats[i];
+#ifdef DEBUG
+        char buf[32];
+        if (s->has_gsv) {
+            sprintf(buf, "GSV PRN %d OK", s->prn);
+            UART0_Println(buf);
+        }
+        if (s->has_corr) {
+            sprintf(buf, "CORR PRN %d OK", s->prn);
+            UART0_Println(buf);
+        }
+#endif
+        if (s->valid)
+            n++;
+    }
+
+    return n;
+}
 
 void parseNMEA(const char* nmea_line) {
-    // Get the sentence identifier
-    if (nmea_line[0] != '$' && nmea_line[0] != '!')
-        return;
-    if (!checkChecksum((const char*)nmea_line))
-        return;
     char id[4];  // The NMEA0183 sentence name
     id[3] = 0;   // zero for a char array
     strncpy(id, nmea_line + 3, 3);
 
-    // this is a comma separated item within
-    // char* token = (char*)malloc(NMEA_LINE_LENGTH);
-    /* get the first token */
-    // const char s[2] = ",";
-    // char* copy = (char*)malloc(sizeof(nmea_line));
-    // strcpy(copy, nmea_line);
-    char* tempstr = strdup(nmea_line);
-    char* token = strtok(tempstr, ",");
+    char* tempstr = (char*)malloc(NMEA_LINE_LENGTH);
+    strncpy(tempstr, nmea_line, NMEA_LINE_LENGTH);
+    tempstr[NMEA_LINE_LENGTH - 1] = '\0';
+
+    if (tempstr == NULL) {
+        return;
+    }
 
     /* walk through other tokens */
-    uint8_t i = 1;
-
     if (!strcmp(id, NMEA_ZDA)) {
         zda_out_counter = 0;
+
         uint8_t hh;
         uint8_t mm;
         uint8_t ss;
         uint8_t dd;
         uint8_t mt;
         uint16_t yr;
-        char buf[10];
-        while (token != NULL) {
-            token = strtok(NULL, ",");  // special case, NULL means next one
-            switch (i) {
-                case 1:
-                    hh = atoi(strncpy(id, token, 2));
-                    mm = atoi(strncpy(id, token + 2, 2));
-                    ss = atoi(strncpy(id, token + 4, 2));
-#ifdef HAS_I2C_LCD
-                    lcd.setCursor(0, 3);
-                    sprintf(buf, "%02u:%02u:%02uz", hh, mm, ss);
-                    lcd.print(buf);
-#endif
-                    break;
-                case 2:
-                    dd = atoi(token);
-                    break;
-                case 3:
-                    mt = atoi(token);
-                    break;
-                case 4:
-                    yr = atoi(token);
-#ifdef HAS_I2C_LCD
-                    // lcd.setCursor(9, 3);
-                    sprintf(buf, " %02u.%02u.%u", dd, mt, yr);
-                    lcd.print(buf);
-#endif
-                    token = NULL;
-                    break;
-            }
+        char* p = tempstr;
+        char* f;
+        uint8_t field = 0;
+        uint8_t run = 1;
+        id[2] = 0;
 
-            i++;
+        while (run && (f = next_field(&p))) {
+            field++;
+            if (field == 2) {
+                hh = atoi(strncpy(id, f, 2));
+                mm = atoi(strncpy(id, f + 2, 2));
+                ss = atoi(strncpy(id, f + 4, 2));
+            } else if (field == 3) {
+                dd = atoi(strncpy(id, f, 2));
+            } else if (field == 4) {
+                mt = atoi(strncpy(id, f, 2));
+            } else if (field == 5) {
+                yr = atoi(strncpy(id, f, 4));
+                char buf[11];
+                lcd.setCursor(0, 3);
+                sprintf(buf, "%02u:%02u:%02uz %02u.%02u.%u", hh, mm, ss, dd, mt, yr);
+                lcd.print(buf);
+
+                run = 0;
+            }
         }
     }
+#ifdef DGPS
+    else if (strncmp(nmea_line, "$BRD03", 6) == 0) {
+        parse_brd03(tempstr);
+
+        ecef_to_llh(dgps_ref_x, dgps_ref_y, dgps_ref_z,
+                    &ref_lat, &ref_lon, &ref_alt);
+        char ref_lat_str[8];
+        dtostrf(ref_lat, 7, 4, ref_lat_str);
+        char ref_lon_str[9];
+        dtostrf(ref_lon, 8, 4, ref_lon_str);
+        lcd.setCursor(0, 0);
+        lcd.print(dgps_station_id);
+        lcd.print(" ");
+        lcd.print(ref_lat_str);
+        lcd.print(" ");
+        lcd.print(ref_lon_str);
+
+    } else if (strncmp(nmea_line, "$BRD09", 6) == 0) {
+        parse_brd09(tempstr);
+    } else if (strncmp(nmea_line, "$GPGSV", 6) == 0) {
+        parse_gsv(tempstr);
+        // if (gsv_cycle_complete) {
+        finalize_gsv_cycle();
+        // }
+    } else if (strncmp(nmea_line, "$GPGGA", 6) == 0) {
+        parse_gga(tempstr);
+        update_sat_validity();
+        valid_sats = count_valid_sats();
+        if (valid_sats >= 4) {
+            compute_corrected(&lat, &lon);
+        } else {
+            lat = current_lat;
+            lon = current_lon;
+        }
+        float correction_magnitude = sqrtf(cx * cx + cy * cy);
+
+        float corr_score = 0.0f;
+        if (correction_magnitude > 5.0f) corr_score = 0.5f;
+        if (correction_magnitude > 15.0f) corr_score = 1.0f;
+
+        float avg_snr = 0;
+        int count = 0;
+
+        for (int i = 0; i < MAX_SATS; i++) {
+            if (!sats[i].valid) continue;
+            avg_snr += sats[i].snr;
+            count++;
+        }
+
+        if (count > 0) avg_snr /= count;
+
+        float snr_score = 0.0f;
+        if (avg_snr < 20) snr_score = 0.7f;
+        if (avg_snr < 10) snr_score = 1.0f;
+
+        float sat_score = 0.0f;
+
+        if (gga.num_satellites < 4 && gga.fix_quality > 0)
+            sat_score = 0.8f;
+
+        float hdop_score = 0.0f;
+
+        if (gga.horizontal_dilution > 3.0f) hdop_score = 0.5f;
+        if (gga.horizontal_dilution > 6.0f) hdop_score = 1.0f;
+
+        float residual = sqrtf((lat - kf.lat) * (lat - kf.lat) +
+                               (lon - kf.lon) * (lon - kf.lon));
+
+        float kf_score = 0.0f;
+
+        if (residual > 0.0001f) kf_score = 0.5f;
+        if (residual > 0.0005f) kf_score = 1.0f;
+
+        kf_update(lat, lon);
+
+        sp_init(&sp);
+
+        sp_add(&sp, "corr", corr_score, 0.25f);
+        sp_add(&sp, "snr", snr_score, 0.20f);
+        sp_add(&sp, "sat", sat_score, 0.15f);
+        sp_add(&sp, "hdop", hdop_score, 0.15f);
+        sp_add(&sp, "kf", kf_score, 0.25f);
+
+        float spoof_score = sp_final(&sp);
+
+        uint8_t spoof_flag = 0;
+
+        if (spoof_score > 0.8f) {
+            spoof_flag = 2;  // strong spoof
+        } else if (spoof_score > 0.6f) {
+            spoof_flag = 1;  // suspicious
+        }
+
+        uint8_t degrees_lat = (uint8_t)lat;
+        uint8_t minutes_lat = (uint8_t)((lat - degrees_lat) * 60);
+        // uint8_t seconds_lat = (uint8_t)(((lat - degrees_lat) * 60 - minutes_lat) * 60);
+
+        uint8_t degrees_lon = (uint8_t)lon;
+        uint8_t minutes_lon = (uint8_t)((lon - degrees_lon) * 60);
+        // uint8_t seconds_lon = (uint8_t)(((lon - degrees_lon) * 60 - minutes_lon) * 60);
+
+        char buf[NMEA_LINE_LENGTH - 9];
+        char s_buf[16];
+
+        uint32_t ssss = (((lat - degrees_lat) * 60 - minutes_lat)) * 1000000;
+        uint32_t lon_ssss = (((lon - degrees_lon) * 60 - minutes_lon)) * 1000000;
+        char hdop_prec[4];
+        dtostrf(gga.horizontal_dilution, 3, 1, hdop_prec);
+        // char antenna_alt[5];
+        // dtostrf(gga.altitude, 4, 1, antenna_alt);
+        uint16_t antenna_int = (uint16_t)gga.altitude;
+        uint16_t antenna_dec = (uint16_t)((gga.altitude - antenna_int) * 10);
+
+        uint16_t undulation_int = (uint16_t)gga.undulation;
+        uint16_t undulation_dec = (uint16_t)((gga.undulation - undulation_int) * 10);
+
+        uint8_t spoof_score_100 = (uint8_t)(sp_final(&sp) * 100.0f + 0.5f);
+        snprintf(buf, sizeof(buf), "%s,%02u%02u.%06lu,%c,%03u%02u.%06lu,%c,%u,%02u,%s,%u.%u,%c,%u.%u,%c,%02u,,", gga.time, degrees_lat, minutes_lat, ssss, (lat >= 0) ? 'N' : 'S', degrees_lon, minutes_lon,
+                 lon_ssss, (lon >= 0) ? 'E' : 'W', gga.fix_quality, gga.num_satellites, hdop_prec, antenna_int, antenna_dec, gga.altitude_units, undulation_int, undulation_dec, gga.undulation_units, (uint8_t)gga.dgps_age);
+        char nmea_line[NMEA_LINE_LENGTH];
+        sprintf(nmea_line, "$MXGGA,%s*", buf);
+        const uint8_t cs = calcChecksum(nmea_line);
+        sprintf(nmea_line, "$MXGGA,%s*%02X", buf, cs);
+        fifo_add(msgout_buf, nmea_line);
+#ifdef HAS_I2C_LCD
+        lcd.setCursor(16, 2);
+        if (spoof_flag == 2) {
+            lcd.print("SPF");
+        } else if (spoof_flag == 1) {
+            lcd.print("SUS");
+        } else {
+            sprintf(buf, "OK%02u", valid_sats);
+            lcd.print(buf);
+        }
+#endif
+#ifdef DEBUG
+        UART0_Println(nmea_line);
+        UART0_Print_P(PSTR("Spoof score: "));
+        dtostrf(spoof_score, 5, 3, s_buf);
+        UART0_Println(s_buf);
+        /* dtostrf(lat - degrees_lat, 7, 4, s_buf);
+        UART0_Println(s_buf); */
+
+        /* sprintf(buf, "$MXGGA,%02u%02u%02u,%02u%02u.%06u,%c,%03u%02u.%06u,%c*",
+                00, 00, 00,
+                degrees_lat, minutes_lat, (uint16_t)((lat - degrees_lat - minutes_lat / 60.0) * 10000),
+                (lat >= 0) ? 'N' : 'S',
+                degrees_lon, minutes_lon, (uint16_t)((lon - degrees_lon - minutes_lon / 60.0) * 10000),
+                (lon >= 0) ? 'E' : 'W');
+        UART0_Println(buf)*/
+        dtostrf(lat, 14, 7, s_buf);
+        UART0_Print_P(PSTR("Current lat: "));
+        UART0_Print(s_buf);
+        dtostrf(lon, 14, 7, s_buf);
+        UART0_Print_P(PSTR(" lon:"));
+        UART0_Println(s_buf);
+#endif
+    }
+#endif
     free(tempstr);
+    // free(token);
 }
 
 void parseParameter(char* p) {
@@ -2160,7 +2848,7 @@ void timerSetup() {
 /**
  * Get parameters from the EEPROM and initialize variables
  */
-void loadParamsFromEEPROM() {
+void loadParamsFromEEPROM(void) {
     // We do have stored parameters, so load them
     uint16_t c = sizeof(uint32_t);  // skip to the next memory address
     for (uint8_t i = 0; i < PORTS; i++) {
@@ -2193,7 +2881,7 @@ void loadParamsFromEEPROM() {
 /**
  * Save variables to the EEPROM as parameters, calculate and store the CRC value
  */
-void saveParamsToEEPROM() {
+void saveParamsToEEPROM(void) {
     // We do have stored parameters, so load them
     uint16_t c = sizeof(uint32_t);  // skip to the next memory address
 

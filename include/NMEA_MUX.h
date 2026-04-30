@@ -17,7 +17,6 @@
 #include <SD.h>
 #endif
 
-
 #ifdef __arm__
 // should use uinstd.h to define sbrk but Due causes a conflict
 extern "C" char* sbrk(int incr);
@@ -27,7 +26,7 @@ extern char* __brkval;
 
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
 
-#define BUILD 990
+#define BUILD 1143
 #define SD_CS 4
 #define PORTS 5
 #define P1 0
@@ -40,11 +39,11 @@ extern char* __brkval;
 #define OUT 2
 #define BOTH 3
 #define SERVER_PORT 10110
-// #ifdef DEBUG
-// #define NMEA_LINES 8
-// #else
-#define NMEA_LINES 24
-// #endif
+#ifdef DEBUG
+#define NMEA_LINES 8
+#else
+#define NMEA_LINES 16
+#endif
 #define FILTER_SIZE 16
 #define NMEA_LINE_LENGTH 82
 #define NMEA_OUT_FILE "nmea_out.txt"
@@ -175,7 +174,6 @@ EthernetServer* server;  // Main server for NMEA connections
 // uint8_t matchFilter(uint8_t index, Filter *filter);
 uint8_t readStream(Stream& stream, uint8_t port_num);
 void sendStream(Stream& stream, uint8_t port_num, char* nmea_line);
-uint8_t checkChecksum(char* nmea_line);
 void sendFreeText(char* text);
 // uint8_t verifyFilter(uint8_t index);
 void printErrorMessage(uint8_t e, bool eol = true);
@@ -192,6 +190,23 @@ void str_replace(char* src, char* oldchars, char* newchars);
 
 uint8_t matchFilter(const char* nmea_line, Filter* filter);
 void timerSetup();
+
+typedef struct {
+    char time[11];
+    float lat;
+    char lat_dir;
+    float lon;
+    char lon_dir;
+    uint8_t fix_quality;
+    uint8_t num_satellites;
+    float horizontal_dilution;
+    float altitude;
+    char altitude_units;
+    float undulation;
+    char undulation_units;
+    float dgps_age;
+    char dgps_station_id[6];
+} gga_t;
 
 /**
  * Calculate CRC from EEPROM
@@ -258,7 +273,7 @@ const char F1[] PROGMEM = "</form><hr><form action='/reset' method='POST' enctyp
 const char F2[] PROGMEM = "</table>\r\n<hr><b>*</b> Effective after reset only.<br><br>";
 const char F3[] PROGMEM = "<form method='POST' action='/' autocomplete='off' enctype='application/x-www-form-urlencoded' style='display: inline-block'>";
 const char F4[] PROGMEM = "<hr><h3>Ethernet Setup</h3>\r\n<table>\r\n<tr><td colspan='2'>Currently active IP settings:</td></tr><tr><td colspan='2'>IP Address: ";
-const char F5[] PROGMEM = "<br><!--<img src='/logo' alt='NJK-IT' width='80' height='80' style='margin-bottom: -11px;'>//--> &copy;2025 - NJK-IT Germany - mux@njk-it.de\r\n</body>\r\n</html>";
+const char F5[] PROGMEM = "<br><!--<img src='/logo' alt='NJK-IT' width='80' height='80' style='margin-bottom: -11px;'>//--> &copy;2026 - NJK-IT Germany - mux@njk-it.de\r\n</body>\r\n</html>";
 
 const char FI3[] PROGMEM = "'></td></tr></select></td></tr>\r\n</table>\r\n</div>";
 
