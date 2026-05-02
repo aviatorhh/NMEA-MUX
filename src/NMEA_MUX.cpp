@@ -16,6 +16,7 @@
 #define ROWS 4
 LiquidCrystal_I2C lcd(0x27, 2, 1, 0, 4, 5, 6, 7, 3, POSITIVE);
 #endif
+#include "dgps.h"
 #include "utils.h"
 
 #ifdef WEB_GUI
@@ -25,7 +26,6 @@ EthernetServer server1(80);
 /* ---------------- */
 float lat, lon;
 gga_t gga;
-volatile uint32_t epoch = 0;
 uint8_t valid_sats = 0;
 #ifdef DGPS
 typedef struct {
@@ -131,7 +131,7 @@ int mqtt_port = 1883;
 char update_host[32];
 
 uint8_t admin_timeout;
-volatile uint8_t zda_out_counter;
+// volatile uint8_t zda_out_counter;
 
 /**
  * Init the soft- and hardware.
@@ -1425,10 +1425,10 @@ void loop() {
         lcd.write(' ');
 
         lcd.setCursor(0, 3);
-        if (zda_out_counter > 4) {
+        /* if (zda_out_counter > 4) {
             lcd.print(F("no ZDA              "));
             zda_out_counter = 5;
-        }
+        } */
 #endif
 
 #endif
@@ -1586,20 +1586,15 @@ struct nmea* extractNMEA(char* nmea_line) {
  */
 ISR(TIMER1_COMPA_vect) {
     uptime++;
-    epoch++;  // increments every second
-    zda_out_counter++;
+    // zda_out_counter++;
     if (!(uptime % 05)) {
         static_send = true;
     }
 }
 #define SAT_TIMEOUT 3   // seconds
 #define CORR_TIMEOUT 3  // seconds
-uint32_t now(void) {
-    return epoch;
-}
-void update_sat_validity(void) {
-    uint32_t t = now();
 
+void update_sat_validity(void) {
     for (int i = 0; i < MAX_SATS; i++) {
         sat_t* s = &sats[i];
 
@@ -1608,7 +1603,7 @@ void update_sat_validity(void) {
         if (!s->has_gsv)
             continue;
 
-        if ((t - s->t_gsv) > SAT_TIMEOUT)
+        if ((uptime - s->t_gsv) > SAT_TIMEOUT)
             continue;
 
         if (s->snr < 8)
@@ -2054,7 +2049,7 @@ void parse_brd03(char* local) {
     dgps_ref_z = z;
 
     dgps_ref_valid = 1;
-    dgps_ref_timestamp = now();
+    dgps_ref_timestamp = uptime;
 }
 void parse_brd09(char* local) {
     /*     char local[NMEA_LINE_LENGTH];
@@ -2086,7 +2081,7 @@ void parse_brd09(char* local) {
 
         s->corr = (1.0f - alpha) * s->corr + alpha * corr;
         s->az = az;
-        s->t_corr = now();
+        s->t_corr = uptime;
         s->has_corr = 1;
     }
 }
@@ -2096,7 +2091,6 @@ static uint8_t gsv_total = 0;
 static uint8_t gsv_seen = 0;
 static uint8_t gsv_mask = 0;
 static uint8_t gsv_msg = 0;
-static uint8_t gsv_last_cycle = 0;
 
 void parse_gsv(char* local) {
     char* p = local;
@@ -2148,7 +2142,7 @@ void parse_gsv(char* local) {
                     // IMPORTANT:
                     // Do NOT set valid or has_gsv here
                     // Just timestamp raw reception
-                    s->t_gsv = now();
+                    s->t_gsv = uptime;
                 }
             }
         }
@@ -2171,7 +2165,7 @@ void finalize_gsv_cycle(void) {
     for (int i = 0; i < MAX_SATS; i++) {
         if (sats[i].snr > 0) {
             sats[i].has_gsv = 1;
-            sats[i].t_gsv = now();
+            sats[i].t_gsv = uptime;
         }
     }
 
@@ -2240,14 +2234,43 @@ void parse_gga(char* local) {
     if (ns == 'S') current_lat = -current_lat;
     if (ew == 'W') current_lon = -current_lon;
 }
-static float deg2rad(float d) {
-    return d * M_PI / 180.0f;
-}
-float nmea_to_deg(float nmea) {
-    int deg = (int)(nmea / 100);
-    float min = nmea - (deg * 100);
-    return deg + (min / 60.0f);
-}
+/* void parse_zda(char* local) {
+    zda_out_counter = 0;
+
+    uint8_t hh;
+    uint8_t mm;
+    uint8_t ss;
+    uint8_t dd;
+    uint8_t mt;
+    uint16_t yr;
+    char* p = local;
+    char* f;
+    uint8_t field = 0;
+    uint8_t run = 1;
+    char id[3];
+    id[2] = 0;
+
+    while (run && (f = next_field(&p))) {
+        field++;
+        if (field == 2) {
+            hh = atoi(strncpy(id, f, 2));
+            mm = atoi(strncpy(id, f + 2, 2));
+            ss = atoi(strncpy(id, f + 4, 2));
+        } else if (field == 3) {
+            dd = atoi(strncpy(id, f, 2));
+        } else if (field == 4) {
+            mt = atoi(strncpy(id, f, 2));
+        } else if (field == 5) {
+            yr = atoi(strncpy(id, f, 4));
+            char buf[11];
+            lcd.setCursor(0, 3);
+            sprintf(buf, "%02u:%02u:%02uz %02u.%02u.%u", hh, mm, ss, dd, mt, yr);
+            lcd.print(buf);
+
+            run = 0;
+        }
+    }
+} */
 
 static uint8_t solve_lsq(float* dE, float* dN) {
     float HtH[3][3] = {0};
@@ -2427,40 +2450,7 @@ void parseNMEA(const char* nmea_line) {
 
     /* walk through other tokens */
     if (!strcmp(id, NMEA_ZDA)) {
-        zda_out_counter = 0;
-
-        uint8_t hh;
-        uint8_t mm;
-        uint8_t ss;
-        uint8_t dd;
-        uint8_t mt;
-        uint16_t yr;
-        char* p = tempstr;
-        char* f;
-        uint8_t field = 0;
-        uint8_t run = 1;
-        id[2] = 0;
-
-        while (run && (f = next_field(&p))) {
-            field++;
-            if (field == 2) {
-                hh = atoi(strncpy(id, f, 2));
-                mm = atoi(strncpy(id, f + 2, 2));
-                ss = atoi(strncpy(id, f + 4, 2));
-            } else if (field == 3) {
-                dd = atoi(strncpy(id, f, 2));
-            } else if (field == 4) {
-                mt = atoi(strncpy(id, f, 2));
-            } else if (field == 5) {
-                yr = atoi(strncpy(id, f, 4));
-                char buf[11];
-                lcd.setCursor(0, 3);
-                sprintf(buf, "%02u:%02u:%02uz %02u.%02u.%u", hh, mm, ss, dd, mt, yr);
-                lcd.print(buf);
-
-                run = 0;
-            }
-        }
+        // parse_zda(tempstr);
     }
 #ifdef DGPS
     else if (strncmp(nmea_line, "$BRD03", 6) == 0) {
@@ -2478,6 +2468,20 @@ void parseNMEA(const char* nmea_line) {
         lcd.print(ref_lat_str);
         lcd.print(" ");
         lcd.print(ref_lon_str);
+
+        // char buffer[32];
+
+        char buffer[32];
+        const char* p = dgps_lookup(dgps_station_id);
+
+        strcpy_P(buffer, p);
+
+        lcd.setCursor(0, 3);
+        if (buffer) {
+            lcd.print(buffer);
+        } else {
+            lcd.print(F("Unknown station"));
+        }
 
     } else if (strncmp(nmea_line, "$BRD09", 6) == 0) {
         parse_brd09(tempstr);
@@ -2578,7 +2582,7 @@ void parseNMEA(const char* nmea_line) {
         uint16_t undulation_int = (uint16_t)gga.undulation;
         uint16_t undulation_dec = (uint16_t)((gga.undulation - undulation_int) * 10);
 
-        uint8_t spoof_score_100 = (uint8_t)(sp_final(&sp) * 100.0f + 0.5f);
+        // uint8_t spoof_score_100 = (uint8_t)(sp_final(&sp) * 100.0f + 0.5f);
         snprintf(buf, sizeof(buf), "%s,%02u%02u.%06lu,%c,%03u%02u.%06lu,%c,%u,%02u,%s,%u.%u,%c,%u.%u,%c,%02u,,", gga.time, degrees_lat, minutes_lat, ssss, (lat >= 0) ? 'N' : 'S', degrees_lon, minutes_lon,
                  lon_ssss, (lon >= 0) ? 'E' : 'W', gga.fix_quality, gga.num_satellites, hdop_prec, antenna_int, antenna_dec, gga.altitude_units, undulation_int, undulation_dec, gga.undulation_units, (uint8_t)gga.dgps_age);
         char nmea_line[NMEA_LINE_LENGTH];

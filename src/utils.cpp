@@ -2,6 +2,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 char* next_field(char** p) {
     if (*p == NULL) return NULL;
@@ -70,7 +71,14 @@ uint8_t checkChecksum(char* nmea_line) {
 }
 
 uint32_t hexStr2Int(char str[]) { return (uint32_t)strtoul(str, 0, 16); }
-
+float deg2rad(float d) {
+    return d * M_PI / 180.0f;
+}
+float nmea_to_deg(float nmea) {
+    int deg = (int)(nmea / 100);
+    float min = nmea - (deg * 100);
+    return deg + (min / 60.0f);
+}
 uint8_t checkChecksum(const char* nmea_line) {
     if (nmea_line[0] != '$' && nmea_line[0] != '!') {
         return 0;
