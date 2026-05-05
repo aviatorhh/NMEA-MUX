@@ -19,6 +19,10 @@ LiquidCrystal_I2C lcd(0x27, 2, 1, 0, 4, 5, 6, 7, 3, POSITIVE);
 #include "dgps.h"
 #include "utils.h"
 
+#ifdef HAS_CAN   
+#include "canbus.h"
+
+#endif
 #ifdef WEB_GUI
 EthernetServer server1(80);
 #endif
@@ -27,24 +31,11 @@ EthernetServer server1(80);
 float lat, lon;
 gga_t gga;
 uint8_t valid_sats = 0;
+uint32_t last_brd03_time = 0;
+
 #ifdef DGPS
-typedef struct {
-    uint8_t prn;
 
-    float corr;
-    float az;
-    float el;
-    float snr;
-
-    uint32_t t_corr;  // last BRD09 update (ms)
-    uint32_t t_gsv;   // last GSV update (ms)
-
-    uint8_t has_corr;
-    uint8_t has_gsv;
-    uint8_t valid;
-} sat_t;
-
-#define MAX_SATS 32
+#define MAX_SATS 24
 static sat_t sats[MAX_SATS];
 static float current_lat = 0.0;
 static float current_lon = 0.0;
@@ -61,32 +52,12 @@ static float dgps_ref_z = 0.0;
 static uint8_t dgps_ref_valid = 0;
 static uint32_t dgps_ref_timestamp = 0;
 
-typedef struct {
-    float lat, lon;
-    float p_lat, p_lon;
-    uint8_t init;
-} kf_t;
-
 static kf_t kf;
-
-#define MAX_SIGNALS 6
-
-typedef struct {
-    const char* name;
-    float value;
-    float weight;
-    float contribution;
-} spoof_signal_t;
-
-typedef struct {
-    spoof_signal_t s[MAX_SIGNALS];
-    uint8_t count;
-    float total;
-    float max;
-} spoof_score_t;
 
 static spoof_score_t sp;
 #endif
+
+char g_buff[40];
 
 fifo_t msgout_buf;
 volatile bool static_send;
@@ -132,6 +103,9 @@ char update_host[32];
 
 uint8_t admin_timeout;
 // volatile uint8_t zda_out_counter;
+#ifdef HAS_CAN  
+CAN can(PH6);
+#endif
 
 /**
  * Init the soft- and hardware.
@@ -177,12 +151,11 @@ void setup() {
     lcd.setCursor(10, 1);
     lcd.write(0b01111111);  // <-
     lcd.print(" 0");
-    // lcd.setCursor(0, 2);
-    // lcd.print("IP:");
 #endif
 
 #ifdef DEBUG
-
+    lcd.setCursor(0, 3);
+    lcd.print("+-+-+-+-+-+-+-+-+-+-");
     uint16_t ubrr = (F_CPU / (DEBUG_BAUD * 8)) - 1;
     UART0_Init(ubrr);
 
@@ -300,9 +273,9 @@ void setup() {
             printsf("Volume size (Kb):  %lu\r\n", volumesize);
             volumesize /= 1024;
             printsf("Volume size (Mb):  %lu\r\n", volumesize);
-            char d_buf[5];
-            dtostrf((float)volumesize / 1024.0, 4, 1, d_buf);
-            printsf("Volume size (Gb):  %s\r\n", d_buf);
+            //char d_buf[5];
+            dtostrf((float)volumesize / 1024.0, 4, 1, g_buff);
+            printsf("Volume size (Gb):  %s\r\n", g_buff);
             const static char txt[] PROGMEM = "\nFiles found on the card (name, date and size in bytes): ";
             UART0_Println_P(txt);
             UART0_Flush();
@@ -808,9 +781,9 @@ void setup() {
 
 #endif
 
-    char t[40];
-    sprintf(t, "%s - MUX4s-1e started", hostname);
-    sendFreeText(t);
+    
+    sprintf(g_buff, "%s - MUX4s-1e started", hostname);
+    sendFreeText(g_buff);
     while (!fifo_is_empty(msgout_buf)) {
         send2All();
     }
@@ -820,12 +793,16 @@ void setup() {
 #endif
     // Timer setup
     timerSetup();
-
+    last_brd03_time = uptime;
     key = random(0xffff);
 
     // enable serial interrupts on Serial 1 for LED blinking
     UCSR0B |= _BV(TXCIE0);
 
+    // Setup CAN interface
+#ifdef HAS_CAN    
+    can.init(SPI_SS, true);
+#endif
     static_send = true;
 }
 
@@ -919,7 +896,7 @@ void loop() {
 
                             // I can't stand to have 404 requests ;-)
                     } else */
-                    if (!strncmp(html_buffer, "GET /favicon.ico ", 17)) {
+                    if (!memcmp(html_buffer, "GET /favicon.ico ", 17)) {
                         image = 1;
                         client.print((const __FlashStringHelper*)HEAD_FAVICON_1);
                         client.print(FAVICON_SIZE, DEC);
@@ -933,24 +910,24 @@ void loop() {
                             client.write(fb);
                         }
                         // main HTML page
-                    } else if (!strncmp(html_buffer, "POST /update ", 13)) {
+                    } else if (!memcmp(html_buffer, "POST /update ", 13)) {
                         post = 1;
                         update = 1;
-                    } else if (!strncmp(html_buffer, "POST /download ", 13)) {
+                    } else if (!memcmp(html_buffer, "POST /download ", 13)) {
                         post = 1;
                         download = 1;
-                    } else if (!strncmp(html_buffer, "POST /reset ", 12)) {
+                    } else if (!memcmp(html_buffer, "POST /reset ", 12)) {
                         post = 1;
                         reset = 1;
-                    } else /*if (!strncmp(html_buffer, "POST /upload ", 13)) {
+                    } else /*if (!memcmp(html_buffer, "POST /upload ", 13)) {
                             post = 1;
                             upload = 1;
                     } else */
-                        if (!strncmp(html_buffer, "POST / ", 7)) {
+                        if (!memcmp(html_buffer, "POST / ", 7)) {
                             post = 1;
-                        } else if (!strncmp(html_buffer, "HEAD / ", 7)) {
+                        } else if (!memcmp(html_buffer, "HEAD / ", 7)) {
                             client.print((const __FlashStringHelper*)HEAD);
-                        } else if (!strncmp(html_buffer, "GET /", 5)) {
+                        } else if (!memcmp(html_buffer, "GET /", 5)) {
                             get = 1;
                         }
 
@@ -1076,7 +1053,6 @@ void loop() {
                         if ((uptime - uptime_admin) < 60 * ADMIN_TIMEOUT) {
                             client.print((const __FlashStringHelper*)F3);
                             for (uint8_t j = 1; j <= PORTS; j++) {
-                                // String num = String(j, DEC);
                                 char num[3];
                                 itoa(j, num, 10);
 
@@ -1367,7 +1343,7 @@ void loop() {
                 // Update requested?
                 if (update) {
                     update = 0;
-                    char t[] = "Updating Firmware";
+                    char t[] = "Upd. Firmware";
                     sendFreeText(t);
                     while (!fifo_is_empty(msgout_buf)) {
                         send2All();
@@ -1379,9 +1355,9 @@ void loop() {
                 c.stop();
 
                 // Software reset
-                char t[40];
-                sprintf(t, "%s - Performing Reset", hostname);
-                sendFreeText(t);
+                //char t[40];
+                sprintf(g_buff, "%s - Performing Reset", hostname);
+                sendFreeText(g_buff);
                 while (!fifo_is_empty(msgout_buf)) {
                     send2All();
                 }
@@ -1394,17 +1370,17 @@ void loop() {
 #endif
 
     if (static_send) {
-        char buf[40];
+        //char buf[40];
 
-        sprintf(buf, "%s - Sent: %lu Recv: %lu Uptime: %lus", hostname, mesg_sent, mesg_recv, uptime);
-        sendFreeText(buf);
+        sprintf(g_buff, "%s,%lu,%lu,%lu,%u,%lu,%u", hostname, uptime, mesg_sent, mesg_recv, dgps_station_id, (uint32_t)dgps_time_s, valid_sats);
+        sendFreeText(g_buff);
 #ifdef ETHERNET
         if (Ethernet.link() == 1) {
             if (mqttClient.connected()) {
                 char buf2[48];
                 sprintf(buf2, "vessels/self/mux/%s/text", hostname);
                 mqttClient.beginMessage(buf2);
-                mqttClient.print(buf);
+                mqttClient.print(g_buff);
                 mqttClient.endMessage();
             } else {
                 connectMQTT(mqtt_broker, mqtt_port);
@@ -1770,16 +1746,15 @@ uint8_t readStream(Stream& stream, uint8_t port_num) {
 }
 
 /**
- * Send the bytes from a stream
+ * Send the bytes to a stream
  */
 void sendStream(Stream& stream, uint8_t port_num, char* nmea_line) {
-    // Is OUT active
+    // Is OUT active on that port?
     if (!(p_config[port_num].direction & OUT)) {
         return;
     }
-    // stream.flush();
-    // while (!// Serial.availableForWrite())
 
+    // Send the line to the stream. We are looking for the end of the string to avoid sending empty characters. If there is no end, we send the whole buffer.
     const char* ptr = strchr(nmea_line, '\0');
     if (ptr) {
         int16_t i = ptr - nmea_line;
@@ -2449,12 +2424,14 @@ void parseNMEA(const char* nmea_line) {
     }
 
     /* walk through other tokens */
-    if (!strcmp(id, NMEA_ZDA)) {
+    if (!memcmp(id, NMEA_ZDA, 3)) {
         // parse_zda(tempstr);
     }
 #ifdef DGPS
-    else if (strncmp(nmea_line, "$BRD03", 6) == 0) {
+    else if (memcmp(nmea_line, "$BRD03", 6) == 0) {
         parse_brd03(tempstr);
+
+#ifdef HAS_I2C_LCD
 
         ecef_to_llh(dgps_ref_x, dgps_ref_y, dgps_ref_z,
                     &ref_lat, &ref_lon, &ref_alt);
@@ -2469,28 +2446,28 @@ void parseNMEA(const char* nmea_line) {
         lcd.print(" ");
         lcd.print(ref_lon_str);
 
-        // char buffer[32];
-
-        char buffer[32];
+        //char buffer[19];
+        g_buff[18] = '\0';
         const char* p = dgps_lookup(dgps_station_id);
+        
+        strncpy_P(g_buff, p, 18);
 
-        strcpy_P(buffer, p);
-
-        lcd.setCursor(0, 3);
-        if (buffer) {
-            lcd.print(buffer);
-        } else {
-            lcd.print(F("Unknown station"));
+        for (uint8_t i = strlen(g_buff); i < 18; i++) {
+            g_buff[i] = ' ';
         }
-
-    } else if (strncmp(nmea_line, "$BRD09", 6) == 0) {
+        
+        lcd.setCursor(0, 3);
+        lcd.print(g_buff);
+        last_brd03_time = uptime;
+#endif
+    } else if (memcmp(nmea_line, "$BRD09", 6) == 0) {
         parse_brd09(tempstr);
-    } else if (strncmp(nmea_line, "$GPGSV", 6) == 0) {
+    } else if (memcmp(nmea_line, "$GPGSV", 6) == 0) {
         parse_gsv(tempstr);
         // if (gsv_cycle_complete) {
         finalize_gsv_cycle();
         // }
-    } else if (strncmp(nmea_line, "$GPGGA", 6) == 0) {
+    } else if (memcmp(nmea_line, "$GPGGA", 6) == 0) {
         parse_gga(tempstr);
         update_sat_validity();
         valid_sats = count_valid_sats();
@@ -2567,8 +2544,8 @@ void parseNMEA(const char* nmea_line) {
         uint8_t minutes_lon = (uint8_t)((lon - degrees_lon) * 60);
         // uint8_t seconds_lon = (uint8_t)(((lon - degrees_lon) * 60 - minutes_lon) * 60);
 
-        char buf[NMEA_LINE_LENGTH - 9];
-        char s_buf[16];
+        static char nmea_buf[NMEA_LINE_LENGTH - 9];
+        
 
         uint32_t ssss = (((lat - degrees_lat) * 60 - minutes_lat)) * 1000000;
         uint32_t lon_ssss = (((lon - degrees_lon) * 60 - minutes_lon)) * 1000000;
@@ -2576,32 +2553,35 @@ void parseNMEA(const char* nmea_line) {
         dtostrf(gga.horizontal_dilution, 3, 1, hdop_prec);
         // char antenna_alt[5];
         // dtostrf(gga.altitude, 4, 1, antenna_alt);
-        uint16_t antenna_int = (uint16_t)gga.altitude;
-        uint16_t antenna_dec = (uint16_t)((gga.altitude - antenna_int) * 10);
+        int16_t antenna_int = (int16_t)gga.altitude;
+        uint16_t antenna_dec = (uint16_t)((abs(gga.altitude) - abs(antenna_int)) * 10);
 
         uint16_t undulation_int = (uint16_t)gga.undulation;
         uint16_t undulation_dec = (uint16_t)((gga.undulation - undulation_int) * 10);
 
         // uint8_t spoof_score_100 = (uint8_t)(sp_final(&sp) * 100.0f + 0.5f);
-        snprintf(buf, sizeof(buf), "%s,%02u%02u.%06lu,%c,%03u%02u.%06lu,%c,%u,%02u,%s,%u.%u,%c,%u.%u,%c,%02u,,", gga.time, degrees_lat, minutes_lat, ssss, (lat >= 0) ? 'N' : 'S', degrees_lon, minutes_lon,
+        snprintf(nmea_buf, sizeof(nmea_buf), "%s,%02u%02u.%06lu,%c,%03u%02u.%06lu,%c,%u,%02u,%s,%d.%u,%c,%u.%u,%c,%02u,,", gga.time, degrees_lat, minutes_lat, ssss, (lat >= 0) ? 'N' : 'S', degrees_lon, minutes_lon,
                  lon_ssss, (lon >= 0) ? 'E' : 'W', gga.fix_quality, gga.num_satellites, hdop_prec, antenna_int, antenna_dec, gga.altitude_units, undulation_int, undulation_dec, gga.undulation_units, (uint8_t)gga.dgps_age);
         char nmea_line[NMEA_LINE_LENGTH];
-        sprintf(nmea_line, "$MXGGA,%s*", buf);
+        sprintf(nmea_line, "$MXGGA,%s*", nmea_buf);
         const uint8_t cs = calcChecksum(nmea_line);
-        sprintf(nmea_line, "$MXGGA,%s*%02X", buf, cs);
+        sprintf(nmea_line, "$MXGGA,%s*%02X", nmea_buf, cs);
         fifo_add(msgout_buf, nmea_line);
 #ifdef HAS_I2C_LCD
-        lcd.setCursor(16, 2);
+        lcd.setCursor(17, 2);
         if (spoof_flag == 2) {
             lcd.print("SPF");
         } else if (spoof_flag == 1) {
             lcd.print("SUS");
         } else {
-            sprintf(buf, "OK%02u", valid_sats);
-            lcd.print(buf);
+            lcd.print(" OK");
         }
+        lcd.setCursor(18, 3);
+        sprintf(g_buff, "%02u", valid_sats);
+        lcd.print(g_buff);
 #endif
 #ifdef DEBUG
+        char s_buf[16];
         UART0_Println(nmea_line);
         UART0_Print_P(PSTR("Spoof score: "));
         dtostrf(spoof_score, 5, 3, s_buf);
@@ -2626,7 +2606,18 @@ void parseNMEA(const char* nmea_line) {
     }
 #endif
     free(tempstr);
-    // free(token);
+
+#ifdef HAS_I2C_LCD
+    if (uptime - last_brd03_time > 360) {  // less than 6 minutes old
+        lcd.setCursor(0, 0);
+        lcd.print(F("NMEA MUX4s-1e       "));
+        lcd.print(BUILD, DEC);
+        lcd.setCursor(0, 3);
+        lcd.print(F("DGPS data too old "));
+        last_brd03_time = uptime;  // prevent repeated printing
+    }
+    
+#endif
 }
 
 void parseParameter(char* p) {
@@ -2658,21 +2649,21 @@ void parseParameter(char* p) {
     for (uint8_t i = 0; i < 4; i++) {
         char k[] = "p1_bau";
         k[1] = i + 49;
-        if (!strncmp(t, k, 6)) {
+        if (!memcmp(t, k, 6)) {
             p_config[i].baud = atol(v);
         }
     }
     for (uint8_t i = 0; i < PORTS; i++) {
         char k[] = "p1_dir";
         k[1] = i + 49;
-        if (!strncmp(t, k, 6)) {
+        if (!memcmp(t, k, 6)) {
             p_config[i].direction = v[0] - 48;
         }
     }
     for (uint8_t i = 0; i < 4; i++) {
         char k[] = "p1_par";
         k[1] = i + 49;
-        if (!strncmp(t, k, 6)) {
+        if (!memcmp(t, k, 6)) {
             p_config[i].parameter = atoi(v);
         }
     }
@@ -2683,7 +2674,7 @@ void parseParameter(char* p) {
     for (uint8_t i = 0; i < PORTS; i++) {
         char k[] = "p1_ifi";
         k[1] = i + 49;
-        if (!strncmp(t, k, 6)) {
+        if (!memcmp(t, k, 6)) {
             char* token;
 
             char* rest = v;
@@ -2711,7 +2702,7 @@ void parseParameter(char* p) {
     for (uint8_t i = 0; i < PORTS; i++) {
         char k[] = "p1_ofi";
         k[1] = i + 49;
-        if (!strncmp(t, k, 6)) {
+        if (!memcmp(t, k, 6)) {
             char* token;
 
             char* rest = v;
@@ -2738,9 +2729,9 @@ void parseParameter(char* p) {
     /**
      * MQTT
      */
-    if (!strncmp(t, "mqtt_host", 9)) {
+    if (!memcmp(t, "mqtt_host", 9)) {
         strcpy(mqtt_broker, v);
-    } else if (!strncmp(t, "mqtt_port", 9)) {
+    } else if (!memcmp(t, "mqtt_port", 9)) {
         mqtt_port = atoi(v);
     }
 
@@ -2748,7 +2739,7 @@ void parseParameter(char* p) {
      * IP Address
      */
     IPAddress ip;
-    if (!strncmp(t, "ip_add", 6)) {
+    if (!memcmp(t, "ip_add", 6)) {
         if (!(i - k)) {
             ip_address[0] = ip_address[1] = ip_address[2] = ip_address[3] = 0;
         } else {
@@ -2758,9 +2749,9 @@ void parseParameter(char* p) {
             ip_address[2] = ip[2];
             ip_address[3] = ip[3];
         }
-    } else if (!strncmp(t, "hostname", 8)) {
+    } else if (!memcmp(t, "hostname", 8)) {
         strcpy(hostname, v);
-    } else if (!strncmp(t, "dns", 3)) {
+    } else if (!memcmp(t, "dns", 3)) {
         if (!(i - k)) {
             dns_a[0] = dns_a[1] = dns_a[2] = dns_a[3] = 0;
         } else {
@@ -2770,7 +2761,7 @@ void parseParameter(char* p) {
             dns_a[2] = ip[2];
             dns_a[3] = ip[3];
         }
-    } else if (!strncmp(t, "gateway", 7)) {
+    } else if (!memcmp(t, "gateway", 7)) {
         if (!(i - k)) {
             gateway[0] = gateway[1] = gateway[2] = gateway[3] = 0;
         } else {
@@ -2782,7 +2773,7 @@ void parseParameter(char* p) {
         }
     }
 
-    else if (!strncmp(t, "subnet", 6)) {
+    else if (!memcmp(t, "subnet", 6)) {
         if (!(i - k)) {
             subnet[0] = subnet[1] = subnet[2] = subnet[3] = 0;
         } else {
@@ -2792,15 +2783,15 @@ void parseParameter(char* p) {
             subnet[2] = ip[2];
             subnet[3] = ip[3];
         }
-    } else if (!strncmp(t, "p5_por", 6)) {
+    } else if (!memcmp(t, "p5_por", 6)) {
         port1 = atoi(v);
-    } else if (!strncmp(t, "key", 3)) {
+    } else if (!memcmp(t, "key", 3)) {
         key_up = atoi(v);
-    } else if (!strncmp(t, "reset_settings", 14)) {
+    } else if (!memcmp(t, "reset_settings", 14)) {
         reset_settings = atoi(v);
-    } else if (!strncmp(t, "build", 5)) {
+    } else if (!memcmp(t, "build", 5)) {
         build_available = atoi(v);
-    } else if (!strncmp(t, "crc32", 5)) {
+    } else if (!memcmp(t, "crc32", 5)) {
         crc_32 = hexStr2Int(v);
     }
 }
