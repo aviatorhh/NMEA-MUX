@@ -3,10 +3,48 @@
 #include <avr/pgmspace.h>
 #include <stdint.h>
 
+#define MAX_SIGNALS 6
+
 typedef struct {
     uint16_t id;
     const char* name;
 } dgps_station_t;
+
+typedef struct {
+    uint8_t prn;
+
+    float corr;
+    float az;
+    float el;
+    float snr;
+
+    uint32_t t_corr;  // last BRD09 update (ms)
+    uint32_t t_gsv;   // last GSV update (ms)
+
+    uint8_t has_corr;
+    uint8_t has_gsv;
+    uint8_t valid;
+} sat_t;
+
+typedef struct {
+    const char* name;
+    float value;
+    float weight;
+    float contribution;
+} spoof_signal_t;
+
+typedef struct {
+    spoof_signal_t s[MAX_SIGNALS];
+    uint8_t count;
+    float total;
+    float max;
+} spoof_score_t;
+
+typedef struct {
+    float lat, lon;
+    float p_lat, p_lon;
+    uint8_t init;
+} kf_t;
 
 static const char s_zeven[] PROGMEM = "Zeven";
 static const char s_helgoland[] PROGMEM = "Helgoland";
@@ -237,7 +275,7 @@ static const char s_sergipe[] PROGMEM = "Sergipe";
 static const char s_cayenne[] PROGMEM = "Cayenne";
 static const char s_gatun[] PROGMEM = "Gatun";
 static const char s_miraflores[] PROGMEM = "Miraflores";
-static const char s_unknown[] PROGMEM = "UNKNOWN";
+static const char s_unknown[] PROGMEM = "Unknown station";
 
 const dgps_station_t dgps_table[] PROGMEM = {
 

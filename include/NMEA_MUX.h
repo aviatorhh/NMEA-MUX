@@ -26,7 +26,7 @@ extern char* __brkval;
 
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
 
-#define BUILD 1161
+#define BUILD 1206
 #define SD_CS 4
 #define PORTS 5
 #define P1 0
@@ -42,7 +42,7 @@ extern char* __brkval;
 #ifdef DEBUG
 #define NMEA_LINES 8
 #else
-#define NMEA_LINES 16
+#define NMEA_LINES 20
 #endif
 #define FILTER_SIZE 16
 #define NMEA_LINE_LENGTH 82
