@@ -35,13 +35,14 @@ start:
     ret
 
 stop:
+    ldi EIMSK, 0    
+
     cbi _SFR_IO_ADDR(PORTB), RESET_BTN_PIN
     cbi _SFR_IO_ADDR(DDRB), BUILTIN_LED
 
 #ifdef ETHERNET
     cbi _SFR_IO_ADDR(DDRC), PC0
 #endif
-    ldi EIMSK, 0    
     ret
 
 led_on:
