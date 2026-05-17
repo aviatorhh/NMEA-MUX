@@ -26,7 +26,7 @@ extern char* __brkval;
 
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
 
-#define BUILD 1206
+#define BUILD 1501
 #define SD_CS 4
 #define PORTS 5
 #define P1 0
@@ -40,9 +40,9 @@ extern char* __brkval;
 #define BOTH 3
 #define SERVER_PORT 10110
 #ifdef DEBUG
-#define NMEA_LINES 8
+#define NMEA_LINES 6
 #else
-#define NMEA_LINES 20
+#define NMEA_LINES 19
 #endif
 #define FILTER_SIZE 16
 #define NMEA_LINE_LENGTH 82
@@ -62,10 +62,10 @@ extern char* __brkval;
 #define RESET_BTN_PIN PL6
 #define BUILTIN_LED PB7
 #define DEBUG_BAUD 115200
-#define MASK_ETH 0b11000010
+// #define MASK_ETH 0b11000010
 #define EMPTY_LINE 1
 
-#define NMEA_ZDA "ZDA"
+// #define NMEA_ZDA "ZDA"
 
 // Timer
 #define HZ 1     // Timer period in seconds
@@ -100,6 +100,7 @@ extern char* __brkval;
 // uint8_t index;    // line index of the NMEA buffer
 const uint8_t crlf[] = {'\r', '\n'};  // newLine
 volatile uint32_t uptime;
+uint32_t last_uptime;
 uint32_t uptime_admin;
 
 // HardwareSerial serials[4] = { Serial, Serial1, Serial2, Serial3 };
@@ -126,11 +127,14 @@ uint8_t has_sd;
 uint8_t has_config;
 uint16_t port1;
 int32_t build_available;
-int32_t build;
+volatile int32_t build;
 uint32_t crc_32;
+uint32_t filesize;
 uint32_t crc_32_calc;
 uint32_t mesg_sent;  // statistics
 uint32_t mesg_recv;  // statistics
+uint32_t last_mesg_recv;
+uint32_t last_mesg_sent;
 uint16_t key;
 uint16_t key_up;
 uint8_t reset_settings;
@@ -173,14 +177,20 @@ EthernetServer* server;  // Main server for NMEA connections
 
 // uint8_t matchFilter(uint8_t index, Filter *filter);
 uint8_t readStream(Stream& stream, uint8_t port_num);
-void sendStream(Stream& stream, uint8_t port_num, char* nmea_line);
+void sendStream(Stream& stream, const uint8_t port_num, char* nmea_line);
 void sendFreeText(char* text);
 // uint8_t verifyFilter(uint8_t index);
+#ifdef SDC
+#ifdef DEBUG
 void printErrorMessage(uint8_t e, bool eol = true);
+#endif
+#endif
 // uint8_t clearDoubleSentence(uint8_t range, uint8_t index);
 void send2All();
 uint32_t crc32(File& file, uint32_t& charcnt);
 inline uint32_t updateCRC32(uint8_t ch, uint32_t crc);
+void perform_reset(void);
+void perform_download(const uint16_t build_available);
 #ifdef WEB_GUI
 void printFilter(Stream& stream, Filter* filter);
 void parseNMEA(const char* nmea_line);
@@ -192,7 +202,7 @@ uint8_t matchFilter(const char* nmea_line, Filter* filter);
 void timerSetup();
 
 typedef struct {
-    char time[11];
+    char time[10];
     float lat;
     char lat_dir;
     float lon;
@@ -207,6 +217,18 @@ typedef struct {
     float dgps_age;
     char dgps_station_id[6];
 } gga_t;
+
+typedef struct {
+    char time[10];
+    char date[7];
+    float lat;
+    float lon;
+    float sog;
+    float cog;
+    char status;
+    float mv;
+    char mv_direction;
+} rmc_t;
 
 /**
  * Calculate CRC from EEPROM
@@ -246,6 +268,10 @@ int freeMemory() {
 #endif  // __arm__
 }
 
+#ifdef DEBUG
+const char txt8[] PROGMEM = "%d-%02d) ofi: %s all: %d";
+#endif
+
 #ifdef SDC
 const char SD_ERROR_1[] PROGMEM = "Could not read 'mac' from section 'network', error was ";
 const char SD_ERROR_2[] PROGMEM = "Could not read 'ip address' from section 'network', error was ";
@@ -257,7 +283,7 @@ const char SD_ERROR_7[] PROGMEM = "Could not read 'hostname' from section 'netwo
 #endif
 
 #ifdef WEB_GUI
-const char H1[] PROGMEM = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-cache, no-store, must-revalidate\r\nPragma: no-cache\r\nExpires: 0\r\nConnection: close\r\n\r\n<!DOCTYPE html><html lang='en'><head><title>MUX4s-1e</title><meta name='viewport' content='width=device-width, initial-scale=1.0'><style>* { font-family: monospace; }table {width: 664px;}td {float: left;}td.fc {width: 120px;overflow: hidden;display: inline-block;white-space: nowrap;float: left;}</style><script>function checkKey(evt) { var ASCIICode = (evt.which) ? evt.which : evt.keyCode; return ((ASCIICode >= 65 && ASCIICode < 91) || ASCIICode == 42 || ASCIICode == 43 || ASCIICode == 45 || ASCIICode == 58 || ASCIICode == 97 || ASCIICode == 108);}function checkKey2(evt) { var ASCIICode = (evt.which) ? evt.which : evt.keyCode; return ((ASCIICode >= 48 && ASCIICode < 58) || ASCIICode == 46);}</script></head>\r\n<body>";
+const char H1[] PROGMEM = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-cache, no-store, must-revalidate\r\nPragma: no-cache\r\nExpires: 0\r\nConnection: close\r\n\r\n<!DOCTYPE html><html lang='en'><head><title>MUX4s-1e</title><meta name='viewport' content='width=device-width, initial-scale=1.0'><style>* { font-family: monospace; }table {width: 664px;}td {float: left;}td.fc {width: 120px;overflow: hidden;display: inline-block;white-space: nowrap;float: left;}</style><script>function checkKey(evt) { var ASCIICode = (evt.which) ? evt.which : evt.keyCode; return ((ASCIICode >= 48 && ASCIICode < 58) || (ASCIICode >= 65 && ASCIICode < 91) || ASCIICode == 42 || ASCIICode == 43 || ASCIICode == 45 || ASCIICode == 58 || ASCIICode == 97 || ASCIICode == 108);}function checkKey2(evt) { var ASCIICode = (evt.which) ? evt.which : evt.keyCode; return ((ASCIICode >= 48 && ASCIICode < 58) || ASCIICode == 46);}</script></head>\r\n<body>";
 
 const char HEAD[] PROGMEM = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
 
@@ -265,9 +291,10 @@ const char H2[] PROGMEM = "HTTP/1.1 200 OK\r\nRefresh:10; url=/\r\nConnection: c
 
 const char HEAD_FAVICON_1[] PROGMEM = "HTTP/1.1 200 OK\r\nContent-Type: image/x-icon\r\nConnection: close\r\nContent-Length: ";
 
-const char UPDATE_FORM_1[] PROGMEM = "<form action='/update' method='POST' enctype='application/x-www-form-urlencoded'><input type='hidden' name='key' value='";
+const char UPDATE_FORM_1[] PROGMEM = "<form action='/reset' method='POST' enctype='application/x-www-form-urlencoded'><input type='hidden' name='key' value='";
 const char UPDATE_FORM_2[] PROGMEM = "'>Update file detected. Start an <button type='submit' name='btn' value='update'>FIRMWARE UPDATE</button>?</form>";
-const char UPDATE_WAIT[] PROGMEM = "HTTP/1.1 200 OK\r\ncontent-type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n<!DOCTYPE html>\r\n<html lang='en'>\r\n\r\n<head>\r\n<meta charset='utf-8' />\r\n<meta name='viewport' content='width=device-width, initial-scale=1' />\r\n<title>MUX4s-1e Updater</title>\r\n<style>* {font-family: monospace;}</style>\r\n<script type='text/javascript'>\r\nvar cnt = 0;\r\nvar stop = false;\r\nfunction verification() {\r\nvar xhr = new XMLHttpRequest();\r\nxhr.open('HEAD', '//' + window.location.hostname + '/', true);\r\nxhr.addEventListener(\"load\", function(e) {\r\nif (xhr.readyState === 4 && xhr.status === 200) {\r\nlocation.href = '/';\r\n}\r\n});\r\nxhr.addEventListener(\"error\", function(e) { stop = true; setTimeout(verification, 2000); });\r\nxhr.addEventListener(\"abort\", function(e) { stop = true; setTimeout(verification, 2000); });\r\nxhr.send();\r\nprogess();\r\n}\r\nfunction progess() {\r\nlet progress = '';\r\ncnt++;\r\nlet t = cnt % 6;\r\nfor (let i = 0; i < t; i++) {\r\nprogress += '. ';\r\n}\r\ndocument.getElementById('prog').innerHTML = progress;\r\nif (!stop) {\r\nsetTimeout(progess, 2000);\r\n}\r\n}\r\n</script>\r\n</head>\r\n<body onload='setTimeout(verification, 2000)'>Wait for update to finish <span id='prog'></span>\r\n</body>\r\n</html>";
+const char UPDATE_WAIT[] PROGMEM = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-cache, no-store, must-revalidate\r\nPragma: no-cache\r\nExpires: 0\r\nConnection: close\r\n\r\n<!DOCTYPE html>\r\n<html lang='en'>\r\n\r\n<head>\r\n<meta charset='utf-8' />\r\n<meta name='viewport' content='width=device-width, initial-scale=1' />\r\n<title>MUX4s-1e Updater</title>\r\n<style>* {font-family: monospace;}</style>\r\n<script type='text/javascript'>\r\nvar cnt = 0;\r\nvar stop = false;\r\nfunction verification() {\r\nlet xhr = new XMLHttpRequest();\r\nxhr.open('HEAD', '//' + window.location.hostname + '/', true);\r\nxhr.onreadystatechange = function (aEvt) {\r\nif (xhr.readyState === 4 && xhr.status === 200) {\r\nlocation.href='/';\r\n}\r\nif (xhr.readyState === 4 && xhr.status === 404) {\r\nsetTimeout(verification, 2000);\r\n}\r\n};\r\nxhr.addEventListener('timeout', function(e) { stop = true; setTimeout(verification, 2000); });\r\nxhr.addEventListener('error', function(e) { stop = true; setTimeout(verification, 2000); });\r\nxhr.timeout = 2000;\r\nxhr.send();\r\n}\r\nfunction progress() {\r\nlet progress_str = '';\r\ncnt++;\r\nlet t = cnt % 6;\r\nfor (let i = 0; i < t; i++) {\r\nprogress_str += '. ';\r\n}\r\ndocument.getElementById('prog').innerHTML = progress_str;\r\nif (!stop) {\r\nsetTimeout(progress, 2000);\r\n}\r\n}\r\nwindow.onload = function() {\r\nprogress();\r\nsetTimeout(verification, 2000);\r\n}\r\n</script>\r\n</head>\r\n<body>Wait for update to finish <span id='prog'></span>\r\n</body>\r\n</html>";
+const char RESET_WAIT[] PROGMEM = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-cache, no-store, must-revalidate\r\nPragma: no-cache\r\nExpires: 0\r\nConnection: close\r\n\r\n<!DOCTYPE html>\r\n<html lang='en'>\r\n\r\n<head>\r\n<meta charset='utf-8' />\r\n<meta name='viewport' content='width=device-width, initial-scale=1' />\r\n<title>MUX4s-1e Updater</title>\r\n<style>* {font-family: monospace;}</style>\r\n<script type='text/javascript'>\r\nvar cnt = 0;\r\nvar stop = false;\r\nfunction verification() {\r\nlet xhr = new XMLHttpRequest();\r\nxhr.open('HEAD', '//' + window.location.hostname + '/', true);\r\nxhr.onreadystatechange = function (aEvt) {\r\nif (xhr.readyState === 4 && xhr.status === 200) {\r\nlocation.href='/';\r\n}\r\nif (xhr.readyState === 4 && xhr.status === 404) {\r\nsetTimeout(verification, 2000);\r\n}\r\n};\r\nxhr.addEventListener('timeout', function(e) { stop = true; setTimeout(verification, 2000); });\r\nxhr.addEventListener('error', function(e) { stop = true; setTimeout(verification, 2000); });\r\nxhr.timeout = 2000;\r\nxhr.send();\r\n}\r\nfunction progress() {\r\nlet progress_str = '';\r\ncnt++;\r\nlet t = cnt % 6;\r\nfor (let i = 0; i < t; i++) {\r\nprogress_str += '. ';\r\n}\r\ndocument.getElementById('prog').innerHTML = progress_str;\r\nif (!stop) {\r\nsetTimeout(progress, 2000);\r\n}\r\n}\r\nwindow.onload = function() {\r\nprogress();\r\nsetTimeout(verification, 2000);\r\n}\r\n</script>\r\n</head>\r\n<body>Wait for reset to complete <span id='prog'></span>\r\n</body>\r\n</html>";
 
 const char F1[] PROGMEM = "</form><hr><form action='/reset' method='POST' enctype='application/x-www-form-urlencoded'><br><button type='submit' value='reset'>RESET DEVICE</button> (Takes ~5s)<br>Want total settings reset? Check this -> <input type='checkbox' name='reset_settings' value='1'> (Resets all filters and port settings incl. network [Factory Reset]).<br>If a config.ini file is present on a SD card, that will be read and stored (if configured).</form><br>";
 const char F2[] PROGMEM = "</table>\r\n<hr><b>*</b> Effective after reset only.<br><br>";

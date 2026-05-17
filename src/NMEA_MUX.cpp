@@ -16,10 +16,10 @@
 #define ROWS 4
 LiquidCrystal_I2C lcd(0x27, 2, 1, 0, 4, 5, 6, 7, 3, POSITIVE);
 #endif
+#include "custom_chars.h"
 #include "dgps.h"
 #include "utils.h"
-
-#ifdef HAS_CAN   
+#ifdef HAS_CAN
 #include "canbus.h"
 
 #endif
@@ -30,8 +30,10 @@ EthernetServer server1(80);
 /* ---------------- */
 float lat, lon;
 gga_t gga;
+rmc_t rmc;
 uint8_t valid_sats = 0;
 uint32_t last_brd03_time = 0;
+uint32_t last_sat_n_time = 0;
 
 #ifdef DGPS
 
@@ -40,9 +42,6 @@ static sat_t sats[MAX_SATS];
 static float current_lat = 0.0;
 static float current_lon = 0.0;
 
-#define WGS84_A 6378137.0f
-#define WGS84_F 1.0f / 298.257223563f
-#define WGS84_E2 (WGS84_F * (2.0f - WGS84_F))
 float ref_lat, ref_lon, ref_alt;
 static uint16_t dgps_station_id = 0;
 static float dgps_time_s = 0.0;
@@ -52,20 +51,41 @@ static float dgps_ref_z = 0.0;
 static uint8_t dgps_ref_valid = 0;
 static uint32_t dgps_ref_timestamp = 0;
 
+static uint8_t gsv_cycle_complete = 0;
+static uint8_t gsv_total = 0;
+static uint8_t gsv_seen = 0;
+static uint8_t gsv_mask = 0;
+static uint8_t gsv_msg = 0;
+
 static kf_t kf;
 
 static spoof_score_t sp;
 #endif
 
-char g_buff[40];
+#ifdef HAS_I2C_LCD
+uint8_t show_state;
+uint8_t show_ipa;
+uint8_t show_mesg_rate;
+uint8_t show_time;
+#endif
+
+uint16_t mps_in;
+uint16_t mps_out;
+
+uint32_t ap_last_time;
+uint32_t dgps_last_time;
+
+uint8_t spoof_flag = 0;
+float cx = 0, cy = 0;
+char g_buff[48];
 
 fifo_t msgout_buf;
 volatile bool static_send;
 
-struct nmea {
-    char id[6];
-    char sentence[79];
-};
+// struct nmea {
+//     char id[6];
+//     char sentence[79];
+// };
 
 #ifdef TRANSLATE
 #define NMEA_DPT "DPT"
@@ -92,7 +112,8 @@ void UART0_Print_num(int16_t num, uint8_t base);
 EthernetClient c;
 MqttClient mqttClient(c);
 void connectMQTT(char* broker, uint16_t port);
-struct nmea* extractNMEA(char* nmea_line);
+// struct nmea* extractNMEA(const char* nmea_line);
+// void extractNMEA(const char* nmea_line, nmea* result);
 void loadParamsFromEEPROM(void);
 void saveParamsToEEPROM(void);
 
@@ -103,8 +124,8 @@ char update_host[32];
 
 uint8_t admin_timeout;
 // volatile uint8_t zda_out_counter;
-#ifdef HAS_CAN  
-CAN can(PH6);
+#ifdef HAS_CAN
+CAN can(SPI_SS);
 #endif
 
 /**
@@ -118,21 +139,25 @@ char c_buf[128];  // global var for sprintf stuff
     sprintf(c_buf, txt, num); \
     UART0_Print(c_buf)
 #endif
+
+/**
+ * Check if the given NMEA line matches the filter. The filter can be either a pattern match or a +all/-all match.
+ */
 void setup() {
 #if defined(__AVR_ATmega328P__)
     const uint32_t uid = ((uint32_t)UniqueID8[4] << 24) + ((uint32_t)UniqueID8[5] << 16) + ((uint32_t)UniqueID8[6] << 8) + UniqueID8[7];
 #endif
     wdt_enable(WDTO_8S);
 
+    uptime = 0;
+    last_uptime = 0;
+    uptime_admin = 0;
+
 #ifdef HAS_I2C_LCD
     // Initiate the LCD:
     lcd.begin(COLS, ROWS);
-
-    /*   programCharIntoLCD(BACK_CHR, back_chr);
-      programCharIntoLCD(BAT_CHR, bat_chr);
-      programCharIntoLCD(C_CHR, c_chr);
-      programCharIntoLCD(T_CHR, t_chr);
-      programCharIntoLCD(F_CHR, f_chr); */
+    lcd.createChar(1, (uint8_t*)upper_min_comma);
+    lcd.createChar(2, (uint8_t*)stop_char);
 
     for (size_t i = 0; i < 2; i++) {
         delay(250);
@@ -145,26 +170,35 @@ void setup() {
     lcd.setCursor(0, 0);
     lcd.print(F("NMEA MUX4s-1e "));
     lcd.print(BUILD, DEC);
-    lcd.setCursor(0, 1);
+    delay(2000);
+    lcd.setCursor(0, 0);
     lcd.write(0b01111110);  // ->
-    lcd.print(" 0");
-    lcd.setCursor(10, 1);
+    lcd.print(F(" 0                 "));
+    lcd.setCursor(0, 1);
     lcd.write(0b01111111);  // <-
     lcd.print(" 0");
 #endif
 
+    build = BUILD;
+    build_available = 0;
+    crc_32_calc = 0;
+    crc_32 = 0;
 #ifdef DEBUG
-    lcd.setCursor(0, 3);
-    lcd.print("+-+-+-+-+-+-+-+-+-+-");
+
     uint16_t ubrr = (F_CPU / (DEBUG_BAUD * 8)) - 1;
     UART0_Init(ubrr);
 
-    printsf("%u - DEBUG enabled\r\n", BUILD);
+    sprintf_P(g_buff, PSTR("%ld - DEBUG enabled"), build);
+    UART0_Println(g_buff);
     UART0_Flush();
 #endif
 
+    // Setup CAN interface
+#ifdef HAS_CAN
+    can.init(SPI_SS, true);
+#endif
+
     randomSeed(analogRead(0));  // init random engine
-    build = BUILD;
 
     // Some Hardware stuff
     start();
@@ -196,11 +230,11 @@ void setup() {
     p_config[P4].ifilter.pm_all = 1;
     p_config[P4].baud = baud[BAUD_38400];
     p_config[P4].parameter = params[0];
-    p_config[P4].direction = BOTH;
+    p_config[P4].direction = OUT;
 
     p_config[PETH1].ofilter.pm_all = 1;
     p_config[PETH1].ifilter.pm_all = 1;
-    p_config[PETH1].direction = BOTH;
+    p_config[PETH1].direction = OUT;
     port1 = SERVER_PORT;
 
     debug = 0;
@@ -211,13 +245,13 @@ void setup() {
     subnet[0] = subnet[1] = subnet[2] = subnet[3] = 0;
 
     strcpy(hostname, HOST_NAME);
-
+    strcpy(update_host, DEFAULT_UPDATE_HOST);
     admin_timeout = ADMIN_TIMEOUT;
 
     uint16_t crc = eeprom_read_word(0);  // Get the CRC from EEPROM, if.
 #ifdef DEBUG
     printsf("%x\r\n", crc);
-    uint8_t l = 0;  // EEPROM data loaded flag
+    uint8_t eeprom_data_loaded = 0;  // EEPROM data loaded flag
 #endif
 
     /**
@@ -273,7 +307,7 @@ void setup() {
             printsf("Volume size (Kb):  %lu\r\n", volumesize);
             volumesize /= 1024;
             printsf("Volume size (Mb):  %lu\r\n", volumesize);
-            //char d_buf[5];
+            // char d_buf[5];
             dtostrf((float)volumesize / 1024.0, 4, 1, g_buff);
             printsf("Volume size (Gb):  %s\r\n", g_buff);
             const static char txt[] PROGMEM = "\nFiles found on the card (name, date and size in bytes): ";
@@ -467,12 +501,11 @@ void setup() {
                             UART0_Print(port);
                             const static char txt2[] PROGMEM = "', error was ";
                             UART0_Print_P(txt2);
-#endif
                             printErrorMessage(ini.getError());
+#endif
                         }
                         if (ini.getValue(port, "ifilter", buffer, bufferLen)) {
-                            char* p = (char*)malloc(bufferLen);
-                            p = strtok(buffer, ":");
+                            char* p = strtok(buffer, ":");
                             uint8_t j = 0;
                             while (p != NULL) {
                                 if (!strcmp(p, "-all")) {
@@ -484,7 +517,6 @@ void setup() {
                                 }
                                 p = strtok(NULL, ":");
                             }
-                            free(p);
 #ifdef DEBUG
                             const static char txt1[] PROGMEM = "ifilter = ";
                             UART0_Print_P(txt1);
@@ -502,8 +534,7 @@ void setup() {
 #endif
                         }
                         if (ini.getValue(port, "ofilter", buffer, bufferLen)) {
-                            char* p = (char*)malloc(bufferLen);
-                            p = strtok(buffer, ":");
+                            char* p = strtok(buffer, ":");
                             uint8_t j = 0;
                             while (p != NULL) {
                                 if (!strcmp(p, "-all")) {
@@ -515,7 +546,6 @@ void setup() {
                                 }
                                 p = strtok(NULL, ":");
                             }
-                            free(p);
 #ifdef DEBUG
                             const static char txt1[] PROGMEM = "ofilter = ";
                             UART0_Print_P(txt1);
@@ -572,13 +602,12 @@ void setup() {
                             UART0_Print(port);
                             const static char txt2[] PROGMEM = "', error was ";
                             UART0_Print_P(txt2);
-#endif
                             printErrorMessage(ini.getError());
+#endif
                         }
                     }
                 }
                 ini.close();
-                // free(filename);
             }
             loaded_from_sd = true;
 #ifdef DEBUG
@@ -599,7 +628,7 @@ void setup() {
         SD.end();
 
 #ifdef DEBUG
-        l = 0;
+        eeprom_data_loaded = 0;
 #endif
     }
 #ifdef DEBUG
@@ -621,12 +650,12 @@ void setup() {
             // Data in EEPROM seems to be valid. Load it.
             loadParamsFromEEPROM();
 #ifdef DEBUG
-            l = 1;
+            eeprom_data_loaded = 1;
 #endif
         }
 
 #ifdef DEBUG
-        if (l) {
+        if (eeprom_data_loaded) {
             const static char txt[] PROGMEM = "Loaded configs from EEPROM";
             UART0_Println_P(txt);
         } else {
@@ -636,17 +665,24 @@ void setup() {
 #endif
     }
     wdt_reset();
-    msgout_buf = fifo_create(NMEA_LINES, NMEA_LINE_LENGTH * sizeof(char));
+    static fifo_descriptor fifo_storage;
+    static uint8_t fifo_itemspace[NMEA_LINES][NMEA_LINE_LENGTH * sizeof(uint8_t)];
+    fifo_storage.itemspace = (uint8_t*)fifo_itemspace;
+    fifo_storage.itemsize = NMEA_LINE_LENGTH * sizeof(uint8_t);
+    fifo_storage.allocatedbytes = NMEA_LINES * NMEA_LINE_LENGTH * sizeof(uint8_t);
+    fifo_storage.readoffset = 0;
+    fifo_storage.writeoffset = 0;
+    fifo_storage.storedbytes = 0;
+
+    msgout_buf = fifo_create_static(&fifo_storage, fifo_itemspace, NMEA_LINES, NMEA_LINE_LENGTH);
 
     // Hardware init
-
 #ifdef DEBUG
     UART0_Flush();
 #endif
 #ifndef DEBUG
     Serial.begin(p_config[P1].baud, p_config[P1].parameter);
 #endif
-    // Serial1.begin(4800, SERIAL_8N1);
     Serial1.begin(p_config[P2].baud, p_config[P2].parameter);
     Serial2.begin(p_config[P3].baud, p_config[P3].parameter);
     Serial3.begin(p_config[P4].baud, p_config[P4].parameter);
@@ -704,20 +740,36 @@ void setup() {
 
 #ifdef ETHERNET
 #ifdef HAS_I2C_LCD
-    lcd.setCursor(0, 2);
-    // char buf[16];
-    IPAddress ipa = Ethernet.localIP();
-    ipa.printTo(lcd);
+    show_state = 1;
+    show_ipa = 1;
+    show_mesg_rate = 0;
+    show_time = 0;
+
+    ap_last_time = uptime;
+    dgps_last_time = uptime;
+
+    if (show_ipa) {
+        lcd.setCursor(0, 3);
+        IPAddress ipa = Ethernet.localIP();
+        sprintf_P(g_buff, PSTR("%d.%d.%d.%d"), ipa[0], ipa[1], ipa[2], ipa[3]);
+
+        for (uint8_t i = strlen(g_buff); i < 18; i++) {
+            g_buff[i] = ' ';
+        }
+        lcd.print(g_buff);
+    }
 #endif
 #ifdef WEB_GUI
 
-    // EthernetClient c;
-    if (has_sd) {
-        if (c.connect(update_host, 80)) {
 #ifdef DEBUG
-            const static char txt2[] PROGMEM = "Looking for updates";
-            UART0_Println_P(txt2);
+    const static char upd_txt[] PROGMEM = "Looking for updates on update server if SD card available ";
+    UART0_Print_P(upd_txt);
+    UART0_Println(update_host);
 #endif
+#ifdef SDC
+    if (has_sd) {
+        c.setTimeout(5000);
+        if (c.connect(update_host, 80)) {
             c.println(F("GET /controller.php?device=MUX4s-1e HTTP/1.1"));
             c.print(F("User-Agent: MUX4s-1e/"));
             c.println(build, DEC);
@@ -730,7 +782,7 @@ void setup() {
             char h_buf[128];
             uint8_t skipped = 0;
             while (c.connected() && !c.available()) delay(1);  // wait for datas
-            // while (c.connected()) {
+
             while (c.connected() || c.available()) {
                 uint16_t b_read = c.readBytesUntil('\n', h_buf, 128);
                 h_buf[b_read] = 0;
@@ -754,10 +806,11 @@ void setup() {
                     parseParameter(h_buf);
                 }
             }
-            // if (skipped) break;
-            // }
             c.stop();
-
+#ifdef DEBUG
+            sprintf_P(g_buff, PSTR("Build on update server: %ld local: %ld"), build_available, build);
+            UART0_Println(g_buff);
+#endif
             if (build == build_available) {
                 if (SD.exists(FIRMWARE_FILE)) {
                     SD.remove(FIRMWARE_FILE);
@@ -766,9 +819,27 @@ void setup() {
                     UART0_Println_P(txt1);
 #endif
                 }
+#ifdef HAS_I2C_LCD
+                lcd.setCursor(0, 2);
+                lcd.print(F("Firmware up to date "));
+                delay(1500);
+                lcd.setCursor(0, 2);
+                lcd.print(F("                    "));
+#endif
+
             }
+#ifdef HAS_I2C_LCD
+            else if (build_available > build) {
+                lcd.setCursor(0, 2);
+                lcd.print(F(">Firmware available<"));
+                delay(1500);
+                lcd.setCursor(0, 2);
+                lcd.print(F("                    "));
+            }
+#endif
         }
     }
+#endif
 #endif
     if (Ethernet.link() == 1) {
 #ifdef DEBUG
@@ -781,33 +852,30 @@ void setup() {
 
 #endif
 
-    
-    sprintf(g_buff, "%s - MUX4s-1e started", hostname);
+    sprintf_P(g_buff, PSTR("%s - MUX4s-1e started"), hostname);
     sendFreeText(g_buff);
     while (!fifo_is_empty(msgout_buf)) {
         send2All();
     }
 #ifdef DEBUG
-    printsf("%s - MUX4s-1e started\r\n", hostname);
+    sprintf_P(g_buff, PSTR("%s - MUX4s-1e started"), hostname);
+    UART0_Println(g_buff);
     UART0_Flush();
 #endif
     // Timer setup
     timerSetup();
     last_brd03_time = uptime;
+    last_sat_n_time = uptime;
     key = random(0xffff);
 
     // enable serial interrupts on Serial 1 for LED blinking
     UCSR0B |= _BV(TXCIE0);
 
-    // Setup CAN interface
-#ifdef HAS_CAN    
-    can.init(SPI_SS, true);
-#endif
-    static_send = true;
+    static_send = false;
 }
 
 /**
- * Main LOOP
+ * Main loop, which is running all the time after setup() has finished. It checks for incoming data on all interfaces, and sends out messages from the output buffer.
  */
 void loop() {
     wdt_reset();
@@ -818,9 +886,7 @@ void loop() {
     // Get the incoming data
 
     if (Serial.available()) {
-        led_on();
         readStream(Serial, P1);
-        led_off();
     }
     while (!fifo_is_empty(msgout_buf)) {
         send2All();
@@ -934,77 +1000,8 @@ void loop() {
                     // ----- Parsing POST Data
 
                     if (b_read == EMPTY_LINE && post && download) {
-                        EthernetClient c;
-
-                        if (c.connect(update_host, 80)) {
-                            c.print(F("GET /controller.php?device=MUX4s-1e&firmware="));
-                            c.print(build_available, DEC);
-                            c.println(F(" HTTP/1.1"));
-                            c.print(F("Host: "));  // devices.njk-it.de"));
-                            c.println(update_host);
-                            c.println(F("Referer: /controller.php?device=MUX4s-1e"));
-                            c.print(F("User-Agent: MUX4s-1e/"));
-                            c.println(build, DEC);
-                            c.print(F("X-current-build: "));
-                            c.println(build, DEC);
-                            c.println(F("X-current-version: 1.1"));
-                            c.println(F("Connection: close"));
-                            c.println();  // end HTTP request header
-                            char h_buf[128];
-                            uint8_t skipped = 0;
-                            if (SD.exists(FIRMWARE_FILE)) {
-                                SD.remove(FIRMWARE_FILE);
-                            }
-
-                            File fh = SD.open(F(FIRMWARE_FILE), FILE_WRITE);
-                            uint16_t b_read = 0;
-                            while (c.connected() && !c.available()) delay(1);  // wait for datas
-                            // while (c.connected()) {
-                            while (c.connected() || c.available()) {
-                                wdt_reset();
-                                if (!skipped)
-                                    b_read = c.readBytesUntil('\n', h_buf, 128);
-
-                                if (!skipped && b_read <= 1) {
-                                    skipped = 1;
-                                    continue;
-                                }
-                                static uint32_t b_count;
-                                if (skipped) {
-                                    b_read = c.readBytes(h_buf, 16);
-                                    b_count += b_read;
-
-                                    if (!(b_count % 512)) {
-                                        led_toggle();
-                                    }
-
-                                    fh.write(h_buf, b_read);
-                                }
-                                // }
-                            }
-                            build = build_available;
-                            fh.flush();
-                            fh.close();
-                            fh = SD.open(F(FIRMWARE_FILE), FILE_READ);
-#ifdef DEBUG
-                            const static char txt1[] PROGMEM = "Calculating CRC...";
-                            UART0_Println(txt1);
-#endif
-                            uint32_t len;
-                            crc_32_calc = crc32(fh, len);
-#ifdef DEBUG
-                            printsf("File length is %lu\r\n", len);
-                            printsf("Calculated CRC %lX\r\n", crc_32_calc);
-                            printsf("Current CRC %lX\r\n", crc_32);
-#endif
-                            if (crc_32 == crc_32_calc) {
-                                // eeprom_write_byte((uint8_t*)EEPROM_FLAG, EEPROM_FLAG_ENABLE);  // set the flag to tell the bootloader to check for new firmware
-                            }
-
-                            fh.close();
-                            led_off();
-                        }
-                        c.stop();
+                        perform_download(build_available);
+                        build = build_available;
                         post = 0;
                         get = 1;
                         b_read = 0;
@@ -1319,8 +1316,11 @@ void loop() {
 #ifdef SDC
                             // If a firmware file is present, display UPDATE button
                             // TODO What if file is on SD card only without CRC online check?
-                            // // Serial.println(crc_32_calc, HEX);// Serial.println(crc_32,HEX);
-                            if (crc_32_calc == crc_32 && SD.exists(FIRMWARE_FILE)) {
+#ifdef DEBUG
+                            sprintf_P(g_buff, PSTR("CRC from file: %lX CRC online: %lX Firmware: %s"), crc_32_calc, crc_32, SD.exists(FIRMWARE_FILE) ? "Present" : "Absent");
+                            UART0_Println(g_buff);
+#endif
+                            if (crc_32_calc == crc_32) {  // && SD.exists(FIRMWARE_FILE)) {
                                 client.print((const __FlashStringHelper*)UPDATE_FORM_1);
                                 client.print(key, DEC);
                                 client.print((const __FlashStringHelper*)UPDATE_FORM_2);
@@ -1330,55 +1330,111 @@ void loop() {
                         client.print((const __FlashStringHelper*)F5);
                         break;
                     } else if (b_read < 3 && reset && !image && !update) {
-                        client.print(F("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-cache, no-store, must-revalidate\r\nPragma: no-cache\r\nExpires: 0\r\nRefresh:10; url=/\r\nConnection: close\r\n\r\n<html lang='en'>\r\n<head>\r\n<meta charset='utf-8' />\r\n<meta name='viewport' content='width=device-width, initial-scale=1' />\r\n<title>MUX4s-1e Updater</title>\r\n<style>* {font-family: monospace;}</style>\r\n<body>Please wait. Page reloads after 10 seconds.</body></html>"));
+                        client.print((const __FlashStringHelper*)RESET_WAIT);
+                        break;
                     }
                 }
             }
             client.flush();
-            delay(1);
+            // delay(1);
             client.stop();
 
             if (reset) {
-                wdt_enable(WDTO_2S);
                 // Update requested?
-                if (update) {
-                    update = 0;
-                    char t[] = "Upd. Firmware";
-                    sendFreeText(t);
-                    while (!fifo_is_empty(msgout_buf)) {
-                        send2All();
-                    }
-                }
-                server->flush();
-                server1.flush();
-                free(server);
-                c.stop();
+                // if (update) {
+                //     update = 0;
+                //     char t[] = "Upd. Firmware";
+                //     sendFreeText(t);
+                //     while (!fifo_is_empty(msgout_buf)) {
+                //         send2All();
+                //     }
+                // }
 
                 // Software reset
-                //char t[40];
-                sprintf(g_buff, "%s - Performing Reset", hostname);
-                sendFreeText(g_buff);
-                while (!fifo_is_empty(msgout_buf)) {
-                    send2All();
-                }
-                stop();
-                while (1);
+                // char t[40];
+                // sprintf_P(g_buff, PSTR("%s - Performing Reset"), hostname);
+                // sendFreeText(g_buff);
+                // while (!fifo_is_empty(msgout_buf)) {
+                //     send2All();
+                // }
+                perform_reset();
             }
         }
 #endif
     }
 #endif
 
-    if (static_send) {
-        //char buf[40];
+    if (uptime > last_uptime) {
+#ifdef HAS_I2C_LCD
+        // Calculate messages per minute coming in and going out and display on LCD. Also display if AP or DGPS data is received (last 5 seconds) and spoofing state. Send all this info as free text to all ports and MQTT if enabled.
+        if (show_mesg_rate) {
+            lcd.setCursor(1, 0);
+            sprintf_P(g_buff, PSTR("%3umsg/s "), mps_in);
+            lcd.print(g_buff);
 
-        sprintf(g_buff, "%s,%lu,%lu,%lu,%u,%lu,%u", hostname, uptime, mesg_sent, mesg_recv, dgps_station_id, (uint32_t)dgps_time_s, valid_sats);
+            lcd.setCursor(1, 1);
+            sprintf_P(g_buff, PSTR("%3umsg/s "), mps_out);
+            lcd.print(g_buff);
+        } else {
+            lcd.setCursor(1, 0);
+            sprintf_P(g_buff, PSTR("%7u  "), mesg_recv);
+            lcd.print(g_buff);
+            lcd.setCursor(1, 1);
+            sprintf_P(g_buff, PSTR("%7u  "), mesg_sent);
+            lcd.print(g_buff);
+        }
+
+#endif
+        last_uptime = uptime;
+    }
+
+    if (static_send) {
+        mps_in = (mesg_recv - last_mesg_recv) / 5;
+        mps_out = (mesg_sent - last_mesg_sent) / 5;
+        last_mesg_recv = mesg_recv;
+        last_mesg_sent = mesg_sent;
+
+        char has_ap_str[3];
+        has_ap_str[2] = '\0';
+        char has_dgps_str[5];
+        has_dgps_str[4] = '\0';
+
+        // sprintf_P(g_buff, PSTR("########## %ld %ld"), ap_last_time, uptime);
+        // UART0_Println(g_buff);
+
+        if (ap_last_time + 5 > uptime) {
+            has_ap_str[0] = 'A';
+            has_ap_str[1] = 'P';
+        } else {
+            has_ap_str[0] = ' ';
+            has_ap_str[1] = ' ';
+        }
+        if (dgps_last_time + 5 > uptime) {
+            has_dgps_str[0] = 'D';
+            has_dgps_str[1] = 'G';
+            has_dgps_str[2] = 'P';
+            has_dgps_str[3] = 'S';
+        } else {
+            has_dgps_str[0] = ' ';
+            has_dgps_str[1] = ' ';
+            has_dgps_str[2] = ' ';
+            has_dgps_str[3] = ' ';
+        }
+        lcd.setCursor(8, 2);
+
+        sprintf_P(g_buff, PSTR(" %s %s "), has_ap_str, has_dgps_str);
+        lcd.print(g_buff);
+
+        uint16_t spoof_score_int = (uint16_t)spoof_score;
+        uint16_t spoof_score_dec = (uint16_t)((spoof_score - spoof_score_int) * 10);
+
+        sprintf_P(g_buff, PSTR("%s,%lu,%lu,%lu,%u,%lu,%u,%u.%u"), hostname, uptime, mesg_sent, mesg_recv, dgps_station_id, (uint32_t)dgps_time_s, valid_sats, spoof_score_int, spoof_score_dec);
         sendFreeText(g_buff);
 #ifdef ETHERNET
         if (Ethernet.link() == 1) {
             if (mqttClient.connected()) {
                 char buf2[48];
-                sprintf(buf2, "vessels/self/mux/%s/text", hostname);
+                sprintf_P(buf2, PSTR("vessels/self/mux/%s/text"), hostname);
                 mqttClient.beginMessage(buf2);
                 mqttClient.print(g_buff);
                 mqttClient.endMessage();
@@ -1388,26 +1444,55 @@ void loop() {
         }
 
 #ifdef HAS_I2C_LCD
-        /* lcd.setCursor(19, 0);
+        if (show_ipa) {
+            lcd.setCursor(0, 3);
+            IPAddress ipa = Ethernet.localIP();
+            // ipa.printTo(lcd);
+            memset(g_buff, 0, 20);
+            sprintf_P(g_buff, PSTR("%d.%d.%d.%d"), ipa[0], ipa[1], ipa[2], ipa[3]);
 
-        if ((uptime - uptime_admin) < 60 * ADMIN_TIMEOUT) {
-            lcd.write('*');
-        } else {
-            lcd.write(' ');
-        } */
+            for (uint8_t i = strlen(g_buff); i < 18; i++) {
+                g_buff[i] = ' ';
+            }
+            lcd.print(g_buff);
+            show_ipa = 0;
+        }
 
-        lcd.setCursor(0, 2);
-        lcd.print(Ethernet.localIP());
-        lcd.write(' ');
+        if (show_state) {
+            lcd.setCursor(17, 2);
+            if (spoof_flag == 2) {
+                lcd.print("SPF");
+            } else if (spoof_flag == 1) {
+                lcd.print("SUS");
+            } else {
+                lcd.print(" OK");
+            }
+            lcd.setCursor(18, 3);
+            if (uptime - last_sat_n_time > 10) {
+                g_buff[0] = '-';
+                g_buff[1] = '-';
+                g_buff[2] = '\0';
+            } else {
+                sprintf(g_buff, "%02u", valid_sats);
+            }
+            lcd.print(g_buff);
+        }
+        // if (show_pos) {
 
-        lcd.setCursor(0, 3);
-        /* if (zda_out_counter > 4) {
-            lcd.print(F("no ZDA              "));
-            zda_out_counter = 5;
-        } */
+        /* dtostrf(lat, 7, 4, g_buff);
+        lcd.print(g_buff);
+        lcd.print(" ");
+        dtostrf(lon, 8, 4, g_buff);
+        lcd.print(g_buff);
+        lcd.print(" "); */
+        // }
+
 #endif
 
 #endif
+        show_time = show_time ? 0 : 1;
+        // show_state = show_state ? 0 : 1;
+        show_mesg_rate = show_mesg_rate ? 0 : 1;
         static_send = false;
     }
 
@@ -1433,50 +1518,49 @@ void send2All() {
         return;
     }
 
-    char nmea_line[NMEA_LINE_LENGTH];
+    static char nmea_line[NMEA_LINE_LENGTH];
     fifo_get(msgout_buf, nmea_line);
 
     if (matchFilter(nmea_line, &(p_config[P1].ofilter))) {
         // Check if it has come from the same source. Avoid to echo if so.
-        if (nmea_line[0] & 0b11000010) {
-            uint8_t t = nmea_line[0];
-            nmea_line[0] &= 0b00111101;
-            led_on();
+        // if (nmea_line[0] & 0b11000010) {
+        // uint8_t t = nmea_line[0];
+        // nmea_line[0] &= 0b00111101;
 #ifndef DEBUG
-            sendStream(Serial, P1, nmea_line);
+        sendStream(Serial, P1, nmea_line);
 #else
-            UART0_Println(nmea_line);
+        UART0_Println(nmea_line);
 #endif
-            // led_off();
-            nmea_line[0] = t;
-        }
+        // led_off();
+        // nmea_line[0] = t;
+        // }
     }
     if (matchFilter(nmea_line, &(p_config[P2].ofilter))) {
         // Check if it has come from the same source. Avoid to echo if so.
-        if ((nmea_line[0] & 0b11000010) != 0b01000000) {
-            uint8_t t = nmea_line[0];
-            nmea_line[0] &= 0b00111101;
-            sendStream(Serial1, P2, nmea_line);
-            nmea_line[0] = t;
-        }
+        // if ((nmea_line[0] & 0b11000010) != 0b01000000) {
+        // uint8_t t = nmea_line[0];
+        // nmea_line[0] &= 0b00111101;
+        sendStream(Serial1, P2, nmea_line);
+        // nmea_line[0] = t;
+        // }
     }
     if (matchFilter(nmea_line, &(p_config[P3].ofilter))) {
         // Check if it has come from the same source. Avoid to echo if so.
-        if ((nmea_line[0] & 0b11000010) != 0b10000000) {
-            uint8_t t = nmea_line[0];
-            nmea_line[0] &= 0b00111101;
-            sendStream(Serial2, P3, nmea_line);
-            nmea_line[0] = t;
-        }
+        // if ((nmea_line[0] & 0b11000010) != 0b10000000) {
+        // uint8_t t = nmea_line[0];
+        // nmea_line[0] &= 0b00111101;
+        sendStream(Serial2, P3, nmea_line);
+        // nmea_line[0] = t;
+        // }
     }
     if (matchFilter(nmea_line, &(p_config[P4].ofilter))) {
         // Check if it has come from the same source. Avoid to echo if so.
-        if ((nmea_line[0] & 0b11000010) != 0b11000000) {
-            uint8_t t = nmea_line[0];
-            nmea_line[0] &= 0b00111101;
-            sendStream(Serial3, P4, nmea_line);
-            nmea_line[0] = t;
-        }
+        // if ((nmea_line[0] & 0b11000010) != 0b11000000) {
+        // uint8_t t = nmea_line[0];
+        // nmea_line[0] &= 0b00111101;
+        sendStream(Serial3, P4, nmea_line);
+        // nmea_line[0] = t;
+        // }
     }
 #ifdef ETHERNET
     // Is OUT active?
@@ -1484,38 +1568,46 @@ void send2All() {
         if ((p_config[PETH1].direction & OUT)) {
             if (matchFilter(nmea_line, &(p_config[PETH1].ofilter))) {
                 // Check if it has come from the same source. Avoid to echo if so.
-                if ((nmea_line[0] & 0b11000010) != 0b000000010) {
-                    nmea_line[0] &= 0b00111101;
-                    const char* ptr = strchr(nmea_line, '\0');
-                    if (ptr) {
-                        int16_t j = ptr - nmea_line;
-                        server->write(nmea_line, j);
-                    } else {
-                        server->write(nmea_line, NMEA_LINE_LENGTH - 2);
-                    }
-                    // server.println("$GTEST*");
-                    server->write(crlf, 2);  // line break
-                    mesg_sent++;
-#ifdef HAS_I2C_LCD
-                    lcd.setCursor(12, 1);
-                    lcd.print(mesg_sent, DEC);
-#endif
+                // if ((nmea_line[0] & 0b11000010) != 0b000000010) {
+                // nmea_line[0] &= 0b00111101;
+                const char* ptr = strchr(nmea_line, '\0');
+                if (ptr) {
+                    int16_t j = ptr - nmea_line;
+                    server->write(nmea_line, j);
+                } else {
+                    server->write(nmea_line, NMEA_LINE_LENGTH - 2);
                 }
+                // server.println("$GTEST*");
+                server->write(crlf, 2);  // line break
+                mesg_sent++;
+                // #ifdef HAS_I2C_LCD
+                //                 lcd.setCursor(2, 1);
+                //                 lcd.print(mesg_sent, DEC);
+                // #endif
+                // }
             }
         }
 
         if (mqttClient.connected()) {
-            char buf[48];
+            // char buf[48];
             nmea_line[0] = '$';
-            struct nmea* result = extractNMEA(nmea_line);
-            if (strcmp(result->id, "NULL")) {
-                sprintf(buf, "vessels/self/nmea0183/%s/%s", hostname, result->id);
-                mqttClient.beginMessage(buf);
-                mqttClient.print(result->sentence);
-                mqttClient.endMessage();
+            if (checkChecksum(nmea_line) != 0) {
+                // nmea* result;
+                static char id[6];
+                static char sentence[NMEA_LINE_LENGTH - 7];
+                // extractNMEA(nmea_line, result);
+                memcpy(id, nmea_line + 1, 5);
+                memcpy(sentence, nmea_line + 7, NMEA_LINE_LENGTH - 7);
+                id[5] = 0;
+                if (id[0] != '\0') {
+                    sprintf_P(g_buff, PSTR("vessels/self/nmea0183/%s/%s"), hostname, id);
+                    mqttClient.beginMessage(g_buff);
+                    mqttClient.print(sentence);
+                    mqttClient.endMessage();
+                }
+                // free(result);
+                // mqttClient.stop();
             }
-            free(result);
-            // mqttClient.stop();
         }
     }
 
@@ -1532,28 +1624,12 @@ void send2All() {
 */
 }
 
+/**
+ * USART0 Transmit Complete Interrupt Service Routine.
+ * Just to switch off the LED after sending a message.
+ */
 ISR(USART0_TX_vect) {
     led_off();
-}
-
-struct nmea* extractNMEA(char* nmea_line) {
-    struct nmea* result = (struct nmea*)malloc(sizeof(struct nmea));
-    // Get the sentence identifier
-    if (nmea_line[0] != '$' && nmea_line[0] != '!') {
-        strcpy(result->id, "NULL");
-        result->id[5] = 0;
-        return result;
-    }
-
-    /* if (!checkChecksum(index))
-        return; */
-
-    // id = (char*)malloc(6);  // The NMEA0183 sentence name
-    strncpy(result->id, nmea_line + 1, 5);
-    // id[5] = 0;
-    strcpy(result->sentence, nmea_line + 7);
-    result->id[5] = 0;
-    return result;
 }
 
 /**
@@ -1567,11 +1643,12 @@ ISR(TIMER1_COMPA_vect) {
         static_send = true;
     }
 }
-#define SAT_TIMEOUT 3   // seconds
-#define CORR_TIMEOUT 3  // seconds
 
+/**
+ * Update the validity of the satellites based on the last GSV message and the SNR and elevation values.
+ */
 void update_sat_validity(void) {
-    for (int i = 0; i < MAX_SATS; i++) {
+    for (uint8_t i = 0; i < MAX_SATS; i++) {
         sat_t* s = &sats[i];
 
         s->valid = 0;
@@ -1594,14 +1671,18 @@ void update_sat_validity(void) {
 /**
  * Read the bytes from a stream
  */
-uint8_t readStream(Stream& stream, uint8_t port_num) {
+uint8_t readStream(Stream& stream, const uint8_t port_num) {
     // Is IN active or buffer full
     if (!(p_config[port_num].direction & IN) || fifo_is_full(msgout_buf)) {
         return 0;
     }
 
+    if (port_num == P1) {
+        led_on();
+    }
+
     // uint8_t read = 0;
-    char nmea_line[NMEA_LINE_LENGTH];
+    static char nmea_line[NMEA_LINE_LENGTH];
 
     // We have three conditions for a "full" read
     // 1. bytes available less then NMEA_LINE_LENGTH
@@ -1633,7 +1714,7 @@ uint8_t readStream(Stream& stream, uint8_t port_num) {
             /**
              *  We are setting a mark/mask to avoid sending back the traffic from where it arrives (see send2All())
              */
-            switch (port_num) {
+            /* switch (port_num) {
                 // P1
                 case 0:
                     nmea_line[0] &= 0b00111111;
@@ -1654,8 +1735,8 @@ uint8_t readStream(Stream& stream, uint8_t port_num) {
                 case 4:
                     nmea_line[0] |= 0b00000010;
                     break;
-            }
-#ifdef TRANSLATE
+            } */
+#ifdef TRANSLATE_
 
             // Get the sentence identifier
             char id[4];  // The NMEA0183 sentence name
@@ -1717,22 +1798,24 @@ uint8_t readStream(Stream& stream, uint8_t port_num) {
 
 #endif
 
-            /*if (clearDoubleSentence(13, index)) {
-             continue;
-             }*/
-            /* read++;
-            index++;
-            if (index >= NMEA_LINES) {
-                    index--;
-                    break;
-            } */
+#ifdef HAS_I2C_LCD
+            lcd.setCursor(9, 0);
+            if (fifo_add(msgout_buf, nmea_line)) {
+                mesg_recv++;
+                lcd.write(' ');
+            } else {
+                lcd.write(0x02);  // full symbol
+            }
+#else
             if (fifo_add(msgout_buf, nmea_line)) {
                 mesg_recv++;
             }
-#ifdef HAS_I2C_LCD
-            lcd.setCursor(2, 1);
-            lcd.print(mesg_recv, DEC);
 #endif
+
+            // #ifdef HAS_I2C_LCD
+
+            //             lcd.print(mesg_recv, DEC);
+            // #endif
             continue;
         } else {
             // No valid line rexeived
@@ -1742,16 +1825,25 @@ uint8_t readStream(Stream& stream, uint8_t port_num) {
     }
     // Flush
     while (stream.read() > -1);
+
+    if (port_num == P1) {
+        led_off();
+    }
+
     return b_read;
 }
 
 /**
  * Send the bytes to a stream
  */
-void sendStream(Stream& stream, uint8_t port_num, char* nmea_line) {
+void sendStream(Stream& stream, const uint8_t port_num, char* nmea_line) {
     // Is OUT active on that port?
     if (!(p_config[port_num].direction & OUT)) {
         return;
+    }
+
+    if (port_num == P1) {
+        led_on();
     }
 
     // Send the line to the stream. We are looking for the end of the string to avoid sending empty characters. If there is no end, we send the whole buffer.
@@ -1764,25 +1856,27 @@ void sendStream(Stream& stream, uint8_t port_num, char* nmea_line) {
         }
     } else {
         stream.write(nmea_line, NMEA_LINE_LENGTH);
+        stream.write(crlf, 2);  // line break
     }
     mesg_sent++;
-#ifdef HAS_I2C_LCD
-    lcd.setCursor(12, 1);
-    lcd.print(mesg_sent, DEC);
-#endif
+    if (port_num == P1) {
+        led_off();
+    }
 }
 
 /**
  * Compare the sentence with the filter element
  * @return 0 if no match, 1 if match
  */
-
+// +MXTXT:-all
 uint8_t matchFilter(const char* nmea_line, Filter* filter) {
     uint8_t match = 1;
     for (uint8_t j = 0; j < FILTER_SIZE; j++) {
         match = 1;
         for (uint8_t i = 1; i <= 5; i++) {
-            if (filter->pattern[j][i] == '*')
+            if (filter->pattern[j][0] == 0) {
+                return filter->pm_all;
+            } else if (filter->pattern[j][i] == '*')
                 continue;
             if (nmea_line[i] != filter->pattern[j][i]) {
                 match = 0;
@@ -1798,20 +1892,23 @@ uint8_t matchFilter(const char* nmea_line, Filter* filter) {
 }
 
 /**
- *
+ * Send a free text message to all ports. The text is sent as $MXTXT,text*hh, where hh is the checksum of the message without the $ and *hh. The text can be up to 30 characters long (NMEA_LINE_LENGTH - 7).
  */
 void sendFreeText(char* text) {
     char nmea_line[NMEA_LINE_LENGTH];
 
-    sprintf(nmea_line, "$MXTXT,%s*", text);
+    sprintf_P(nmea_line, PSTR("$MXTXT,%s*"), text);
     const uint8_t cs = calcChecksum(nmea_line);
-    sprintf(nmea_line, "$MXTXT,%s*%02X", text, cs);
+    sprintf_P(nmea_line, PSTR("$MXTXT,%s*%02X"), text, cs);
     fifo_add(msgout_buf, nmea_line);
 }
 
-void printErrorMessage(uint8_t e, bool eol) {
 #ifdef SDC
 #ifdef DEBUG
+/**
+ * Print the error message for the given error code
+ */
+void printErrorMessage(uint8_t e, bool eol) {
     switch (e) {
         case IniFile::errorNoError:
             const static char txt1[] PROGMEM = "no error";
@@ -1857,10 +1954,13 @@ void printErrorMessage(uint8_t e, bool eol) {
     if (eol) {
         UART0_Println("");
     }
-#endif
-#endif
 }
+#endif
+#endif
 
+/**
+ * Calculate the CRC32 of a file. The charcnt is the number of characters read from the file.
+ */
 uint32_t crc32(File& file, uint32_t& charcnt) {
     uint32_t oldcrc32 = 0xFFFFFFFF;
     charcnt = 0;
@@ -1875,28 +1975,19 @@ uint32_t crc32(File& file, uint32_t& charcnt) {
     return ~oldcrc32;
 }
 
+/**
+ * Update the CRC32 with the given byte. The crc is the current CRC value.
+ */
 inline uint32_t updateCRC32(uint8_t ch, uint32_t crc) {
     uint32_t idx = ((crc) ^ (ch)) & 0xff;
     uint32_t tab_value = pgm_read_dword(crc_32_tab + idx);
     return tab_value ^ ((crc) >> 8);
 }
 
-/*
- uint8_t clearDoubleSentence(uint8_t range, uint8_t idx) {
- // Iterate over buffer and look for similar
- if (idx == 0) return 0;
- for (uint8_t i = 0; i < idx; i++) {
- // compare and if found, replace
- if (!strncmp(nmea_buffer[idx], nmea_buffer[i], range)) {
- memcpy(nmea_buffer[i], nmea_buffer[idx], NMEA_LINE_LENGTH);
- return 1;
- }
- }
- return 0;
-
- }
- */
 #ifdef WEB_GUI
+/**
+ * Print the filter pattern to the stream. If the pattern is empty, print +all or -all depending on the pm_all flag.
+ */
 void printFilter(Stream& stream, Filter* filter) {
     for (uint8_t i = 0; i < FILTER_SIZE; i++) {
         if (!filter->pattern[i][0]) {
@@ -1908,35 +1999,11 @@ void printFilter(Stream& stream, Filter* filter) {
     }
 }
 #ifdef DGPS
-void sp_init(spoof_score_t* sp) {
-    sp->count = 0;
-    sp->total = 0.0f;
-    sp->max = 0.0f;
-}
-
-void sp_add(spoof_score_t* sp, const char* name, float value, float weight) {
-    if (sp->count >= MAX_SIGNALS) return;
-
-    if (value < 0) value = 0;
-    if (value > 1) value = 1;
-
-    spoof_signal_t* sig = &sp->s[sp->count++];
-    sig->name = name;
-    sig->value = value;
-    sig->weight = weight;
-    sig->contribution = value * weight;
-
-    sp->total += sig->contribution;
-    sp->max += weight;
-}
-
-float sp_final(spoof_score_t* sp) {
-    if (sp->max < 0.0001f) return 0.0f;
-    return sp->total / sp->max;
-}
 
 /* ================= SAT MANAGEMENT ================= */
-
+/**
+ * Get the satellite struct for the given PRN. If it does not exist, allocate an empty slot. If there is no empty slot, return NULL.
+ */
 sat_t* get_sat(uint8_t prn) {
     for (int i = 0; i < MAX_SATS; i++) {
         if (sats[i].prn == prn)
@@ -1953,36 +2020,23 @@ sat_t* get_sat(uint8_t prn) {
 
     return NULL;
 }
-void ecef_to_llh(float x, float y, float z,
-                 float* lat, float* lon, float* alt) {
-    float lon_r = atan2f(y, x);
 
-    float p = sqrtf(x * x + y * y);
-
-    float lat_r = atan2f(z, p * (1.0f - WGS84_E2));
-
-    float prev_lat;
-
-    // iterative refinement (2–3 iterations is enough)
-    for (int i = 0; i < 3; i++) {
-        float sin_lat = sinf(lat_r);
-        float N = WGS84_A / sqrtf(1.0f - WGS84_E2 * sin_lat * sin_lat);
-
-        prev_lat = lat_r;
-        lat_r = atan2f(z + WGS84_E2 * N * sin_lat, p);
-
-        if (fabsf(lat_r - prev_lat) < 1e-10f)
-            break;
-    }
-
-    float sin_lat = sinf(lat_r);
-    float N = WGS84_A / sqrtf(1.0f - WGS84_E2 * sin_lat * sin_lat);
-
-    *alt = p / cosf(lat_r) - N;
-    *lat = lat_r * 180.0f / M_PI;
-    *lon = lon_r * 180.0f / M_PI;
-}
 /* ================= PARSERS ================= */
+
+/**
+ * Parse the BRD03 message to extract the DGPS reference station information
+ * Example:
+ * $BRD03,A,1234,5678.9,0,123456.789,12.345,67.890*hh
+ * Field Number:
+ * 1) Status (A=active, V=void)
+ * 2) Station ID
+ * 3) Time (s)
+ * 4) (not used)
+ * 5) X (m)
+ * 6) Y (m)
+ * 7) Z (m)
+ * 8) Checksum
+ */
 void parse_brd03(char* local) {
     char* p = local;
     char* f;
@@ -2026,11 +2080,23 @@ void parse_brd03(char* local) {
     dgps_ref_valid = 1;
     dgps_ref_timestamp = uptime;
 }
-void parse_brd09(char* local) {
-    /*     char local[NMEA_LINE_LENGTH];
-        strncpy(local, line, NMEA_LINE_LENGTH);
-        local[NMEA_LINE_LENGTH - 1] = '\0'; */
 
+/**
+ * Parse the BRD09 message to extract the DGPS correction information
+ * Example:
+ * $BRD09,A,1234,5678.9,0,123456.789,12.345,67.890*hh
+ * Field Number:
+ * 1) Status (A=active, V=void)
+ * 2) Station ID
+ * 3) Time (s)
+ * 4) (not used)
+ * 5) PRN
+ * 6) Correction (m)
+ * 7) (not used)
+ * 8) Azimuth (degrees)
+ * 9) Checksum
+ */
+void parse_brd09(char* local) {
     char* p = local;
     char* f;
     int field = 0;
@@ -2061,16 +2127,19 @@ void parse_brd09(char* local) {
     }
 }
 
-static uint8_t gsv_cycle_complete = 0;
-static uint8_t gsv_total = 0;
-static uint8_t gsv_seen = 0;
-static uint8_t gsv_mask = 0;
-static uint8_t gsv_msg = 0;
-
+/**
+ * Parse the GSV message to extract the satellite information
+ * Example:
+ * $GPGSV,2,1,08,01,40,083,41,02,17,273,43,03,27,123,42,04,13,213,40*hh
+ * Field Number:
+ * 1) Total number of messages of this type in this cycle
+ * 2) Message number
+ * 3) Total number of satellites in view
+ */
 void parse_gsv(char* local) {
     char* p = local;
     char* f;
-    int field = 0;
+    uint8_t field = 0;
 
     uint8_t prn = 0;
 
@@ -2092,7 +2161,7 @@ void parse_gsv(char* local) {
 
         // --- Satellite blocks start at field 5 ---
         else if (field >= 5) {
-            int offset = (field - 5) % 4;
+            uint8_t offset = (field - 5) % 4;
 
             if (offset == 0) {
                 // PRN
@@ -2153,6 +2222,95 @@ void finalize_gsv_cycle(void) {
     UART0_Println("GSV cycle complete");
 #endif
 }
+
+/**
+ * Parse the RMC message to extract the current position and time information
+ * Example:
+ * $GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*hh
+ * Field Number:
+ * 1) Time (UTC)
+ * 2) Status (A=active, V=void)
+ * 3) Latitude (ddmm.mmm)
+ * 4) N/S Indicator
+ * 5) Longitude (dddmm.mmm)
+ * 6) E/W Indicator
+ * 7) Speed over ground (knots)
+ * 8) Track angle in degrees
+ * 9) Date (ddmmyy)
+ * 10) Magnetic Variation (degrees)
+ * 11) Magnetic Variation E/W Indicator
+ * 12) Checksum
+ */
+void parse_rmc(char* local) {
+    char* p = local;
+    char* f;
+    int field = 0;
+
+    // char status = 'V';
+    float lat = 0.0f, lon = 0.0f;
+    char ns = 'N', ew = 'E';
+
+    while ((f = next_field(&p))) {
+        field++;
+        if (field == 2) {
+            memcpy(rmc.time, f, 9);
+            rmc.time[9] = '\0';
+        } else if (field == 3)
+            rmc.status = f[0];
+        if (field == 4)
+            lat = atof(f);
+        else if (field == 5)
+            ns = f[0];
+        else if (field == 6)
+            lon = atof(f);
+        else if (field == 7)
+            ew = f[0];
+        else if (field == 8)
+            rmc.sog = atof(f);
+        else if (field == 9)
+            rmc.cog = atof(f);
+        else if (field == 10) {
+            memcpy(rmc.date, f, 6);
+            rmc.date[6] = '\0';
+        } else if (field == 11)
+            rmc.mv = atof(f);
+        else if (field == 12)
+            rmc.mv_direction = f[0];
+    }
+
+    // int lat_d = (int)(lat / 100);
+    // float lat_m = lat - lat_d * 100;
+    // current_lat = lat_d + lat_m / 60.0f;
+
+    // int lon_d = (int)(lon / 100);
+    // float lon_m = lon - lon_d * 100;
+    // current_lon = lon_d + lon_m / 60.0f;
+
+    // if (ns == 'S') current_lat = -current_lat;
+    // if (ew == 'W') current_lon = -current_lon;
+}
+
+/**
+ * Parse the GGA message to extract the current position and DGPS information
+ * Example:
+ * $GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*hh
+ * Field Number:
+ * 1) Time (UTC)
+ * 2) Latitude (ddmm.mmm)
+ * 3) N/S Indicator
+ * 4) Longitude (dddmm.mmm)
+ * 5) E/W Indicator
+ * 6) Fix Quality (0 = invalid, 1 = GPS fix, 2 = DGPS fix)
+ * 7) Number of Satellites
+ * 8) Horizontal Dilution of Precision (HDOP)
+ * 9) Altitude (m)
+ * 10) Altitude Units
+ * 11) Geoidal Separation (m)
+ * 12) Geoidal Separation Units
+ * 13) DGPS Age (s)
+ * 14) DGPS Station ID
+ * 15) Checksum
+ */
 void parse_gga(char* local) {
     /*     char local[NMEA_LINE_LENGTH];
         strncpy(local, line, NMEA_LINE_LENGTH);
@@ -2168,7 +2326,8 @@ void parse_gga(char* local) {
     while ((f = next_field(&p))) {
         field++;
         if (field == 2) {
-            strncpy(gga.time, f, 10);
+            memcpy(gga.time, f, 9);
+            gga.time[9] = '\0';
         }
         if (field == 3)
             lat = atof(f);
@@ -2247,6 +2406,12 @@ void parse_gga(char* local) {
     }
 } */
 
+/**
+ * Solve the least squares problem for DGPS correction
+ * @param dE Pointer to the eastward correction
+ * @param dN Pointer to the northward correction
+ * @return 1 if successful, 0 otherwise
+ */
 static uint8_t solve_lsq(float* dE, float* dN) {
     float HtH[3][3] = {0};
     float HtV[3] = {0};
@@ -2313,7 +2478,13 @@ static uint8_t solve_lsq(float* dE, float* dN) {
     return 1;
 }
 
-float cx = 0, cy = 0;
+/**
+ * Compute the corrected position using the DGPS corrections and outlier rejection
+ * This is the main function that implements the DGPS correction algorithm
+ * It consists of two passes:
+ * 1. Compute the initial correction using all valid satellites
+ * 2. Reject outliers based on the residuals and recompute the correction
+ */
 void compute_corrected(float* lat_out, float* lon_out) {
     float lat = current_lat;
     float lon = current_lon;
@@ -2352,10 +2523,12 @@ void compute_corrected(float* lat_out, float* lon_out) {
         *lon_out = lon;
         return;
     }
-
+    cx = dE;
+    cy = dN;
     // --- APPLY ---
+    float lat0 = lat;
     lat += dN / 111320.0f;
-    lon += dE / (111320.0f * cosf(deg2rad(lat)));
+    lon += dE / (111320.0f * cosf(deg2rad(lat0)));
 
     *lat_out = lat;
     *lon_out = lon;
@@ -2387,19 +2560,23 @@ void kf_update(float lat, float lon) {
     kf.p_lon *= (1.0f - k_lon);
 }
 #endif
-int count_valid_sats(void) {
-    int n = 0;
 
-    for (int i = 0; i < MAX_SATS; i++) {
+/**
+ * Count the number of valid satellites
+ */
+uint8_t count_valid_sats(void) {
+    uint8_t n = 0;
+
+    for (uint8_t i = 0; i < MAX_SATS; i++) {
         sat_t* s = &sats[i];
 #ifdef DEBUG
         char buf[32];
         if (s->has_gsv) {
-            sprintf(buf, "GSV PRN %d OK", s->prn);
+            sprintf_P(buf, PSTR("GSV PRN %d OK"), s->prn);
             UART0_Println(buf);
         }
         if (s->has_corr) {
-            sprintf(buf, "CORR PRN %d OK", s->prn);
+            sprintf_P(buf, PSTR("CORR PRN %d OK"), s->prn);
             UART0_Println(buf);
         }
 #endif
@@ -2409,31 +2586,241 @@ int count_valid_sats(void) {
 
     return n;
 }
+#ifdef TRANSLATE
+void parse_dpt(char* local) {
+    // Store the original message as it will be changed bleow
+    fifo_add(msgout_buf, local);
+    mesg_recv++;  // got one more
+                  // #ifdef HAS_I2C_LCD
+                  //     lcd.setCursor(2, 0);
+                  //     lcd.print(mesg_recv, DEC);
+                  // #endif
 
+    // store the input port check character
+    // char check = local[0];
+
+    // $--DPT,x.x,x.x*hh<CR><LF>
+    // Field Number:
+    //   1) Depth, meters
+    //   2) Offset from transducer,
+    //      positive means distance from tansducer to water line
+    //      negative means distance from transducer to keel
+    //   3) Checksum
+
+    // this is a comma separated item within
+    // char* token = (char*)malloc(10);
+    /* get the first token */
+    char* token = strtok(local, ",");
+
+    if (token != NULL) {
+        token = strtok(NULL, ",");
+
+        // if (i == 1) {
+        float depth_m = atof(token);
+        float depth_f = depth_m * 3.28084;
+        float depth_fh = depth_m * 0.546807;
+
+        char buf_f[7];  // can easily be greater
+        char buf_m[6];
+        char buf_fh[6];
+        dtostrf(depth_f, 3, 1, buf_f);
+        dtostrf(depth_m, 3, 1, buf_m);
+        dtostrf(depth_fh, 3, 1, buf_fh);
+
+        sprintf_P(g_buff, PSTR("$MXDBS,%s,f,%s,M,%s,F*"), buf_f, buf_m, buf_fh);
+        const uint8_t cs = calcChecksum(g_buff);
+
+        sprintf(local, "%s%02X", g_buff, cs);
+        // nmea_line[0] = check;
+    }
+
+    // $IIDPT,3.5,0.5*43
+    // $IIDPT,30.5,0.5*73
+    // $IIDPT,200.5,0.5*42
+    // $IIDPT,600.5,0.5*46
+}
+#endif
+void perform_reset(void) {
+#ifdef HAS_I2C_LCD
+    lcd.clear();
+    lcd.print(F("Performing Reset"));
+#endif
+    cli();
+    ADCSRA = 0;
+    TCCR0A = 0;
+    TCCR0B = 0;
+    TCCR1A = 0;
+    TCCR1B = 0;
+    TCCR2A = 0;
+    TCCR2B = 0;
+    TCCR3A = 0;
+    TCCR3B = 0;
+    TCCR4A = 0;
+    TCCR4B = 0;
+    UCSR0A = 0;
+    UCSR0B = 0;
+    UCSR1A = 0;
+    UCSR1B = 0;
+    UCSR2A = 0;
+    UCSR2B = 0;
+    UCSR3A = 0;
+    UCSR3B = 0;
+    c.stop();
+    server->flush();
+    server1.flush();
+    free(server);
+    wdt_enable(WDTO_1S);
+    stop();
+    while (1);
+}
+void perform_download(const uint16_t build_available) {
+    EthernetClient c;
+
+    if (c.connect(update_host, 80)) {
+        c.print(F("GET /controller.php?device=MUX4s-1e&firmware="));
+        c.print(build_available, DEC);
+        c.println(F(" HTTP/1.1"));
+        c.print(F("Host: "));  // devices.njk-it.de"));
+        c.println(update_host);
+        c.println(F("Referer: /controller.php?device=MUX4s-1e"));
+        c.print(F("User-Agent: MUX4s-1e/"));
+        c.println(build, DEC);
+        c.print(F("X-current-build: "));
+        c.println(build, DEC);
+        c.println(F("X-current-version: 1.1"));
+        c.println(F("Connection: close"));
+        c.println();  // end HTTP request header
+        // uint8_t h_buf[128];
+
+        if (SD.exists(FIRMWARE_FILE)) {
+            SD.remove(FIRMWARE_FILE);
+        }
+
+        uint16_t b_read = 0;
+        while (c.connected() && !c.available()) delay(1);  // wait for data
+        File fh = SD.open(FIRMWARE_FILE, O_WRITE | O_CREAT);
+        uint8_t skipped = 0;
+#ifdef HAS_I2C_LCD
+        lcd.setCursor(0, 2);
+        lcd.print(F("                    "));  // clear line
+        lcd.setCursor(0, 3);
+        lcd.print(F("                    "));  // clear line
+#endif
+        static uint32_t b_count = 0;
+        while (c.connected() || c.available()) {
+            wdt_reset();
+            if (!skipped)
+                b_read = c.readBytesUntil('\n', g_buff, 48);
+
+            // skip HTTP header
+            if (!skipped && b_read <= 1) {
+                skipped = 1;
+                continue;
+            }
+
+            if (skipped) {
+                b_read = c.readBytes(g_buff, 48);
+                b_count += b_read;
+                fh.write(g_buff, b_read);
+                if (!(b_count % 512)) {
+                    led_toggle();
+#ifdef HAS_I2C_LCD
+                    lcd.setCursor(0, 2);
+                    sprintf_P(g_buff, PSTR("Downloading: %luKb"), b_count / 1024);
+                    lcd.print(g_buff);
+                    uint8_t steps = ((float)b_count / (float)filesize) * 19;
+                    for (uint8_t i = 0; i <= steps; i++) {
+                        g_buff[i] = 0xff;
+                    }
+                    g_buff[steps] = 0xff;
+                    g_buff[steps + 1] = 0;
+                    lcd.setCursor(0, 3);
+                    lcd.print(g_buff);
+#endif
+                }
+            }
+            // }
+        }
+
+        fh.close();
+        fh = SD.open(FIRMWARE_FILE, FILE_READ);
+#ifdef DEBUG
+        const static char txt1[] PROGMEM = "Calculating CRC...";
+        UART0_Println(txt1);
+#endif
+        uint32_t len;
+        crc_32_calc = crc32(fh, len);
+#ifdef DEBUG
+        printsf("File length is %lu\r\n", len);
+        printsf("Calculated CRC %lX\r\n", crc_32_calc);
+        printsf("Current CRC %lX\r\n", crc_32);
+#endif
+        // if (crc_32 == crc_32_calc) {
+        //     // eeprom_write_byte((uint8_t*)EEPROM_FLAG, EEPROM_FLAG_ENABLE);  // set the flag to tell the bootloader to check for new firmware
+        // }
+
+        fh.close();
+        led_off();
+#ifdef HAS_I2C_LCD
+        lcd.setCursor(0, 3);
+        lcd.print(F("                    "));  // clear line
+        lcd.setCursor(0, 3);
+        sprintf_P(g_buff, PSTR("%lX / %lX "), crc_32_calc, crc_32);
+        lcd.print(g_buff);
+#endif
+    }
+    c.stop();
+}
+void parse_cmd(char* cmd_line) {
+    // $MXCMD,command*hh
+
+    char* token = strtok(cmd_line, "*");
+
+    token = strtok(token, ",");  // this should be $MXCMD
+    token = strtok(NULL, ",");
+    if (strcmp(token, "download") == 0) {
+        token = strtok(NULL, ",");
+        if (token) {
+            const uint16_t version = (uint16_t)strtoul(token, NULL, 10);
+            build_available = version;
+            perform_download(version);
+            build = version;
+        }
+    } else if (strcmp(token, "reset") == 0) {
+        perform_reset();
+    } else if (strcmp(token, "unlock") == 0) {
+        uptime_admin = uptime;
+    }
+}
+
+/**
+ * Parse the NMEA line and update internal state accordingly
+ */
 void parseNMEA(const char* nmea_line) {
-    char id[4];  // The NMEA0183 sentence name
-    id[3] = 0;   // zero for a char array
-    strncpy(id, nmea_line + 3, 3);
-
-    char* tempstr = (char*)malloc(NMEA_LINE_LENGTH);
-    strncpy(tempstr, nmea_line, NMEA_LINE_LENGTH);
+    static char tempstr[NMEA_LINE_LENGTH];
+    memcpy(tempstr, nmea_line, NMEA_LINE_LENGTH);
     tempstr[NMEA_LINE_LENGTH - 1] = '\0';
 
-    if (tempstr == NULL) {
-        return;
-    }
+    static char nmea_buf[NMEA_LINE_LENGTH - 9];
 
-    /* walk through other tokens */
-    if (!memcmp(id, NMEA_ZDA, 3)) {
-        // parse_zda(tempstr);
+#ifdef TRANSLATE
+    if (memcmp(tempstr + 3, NMEA_DPT, 3) == 0) {
+        // DPT is used for testing the translation feature, so we parse it even if translation is disabled
+        parse_dpt(tempstr);
+    } else
+#endif
+        if (memcmp(tempstr + 1, "AP", 2) == 0) {
+        ap_last_time = uptime;
+    } else if (memcmp(tempstr + 1, "MXCMD", 5) == 0) {
+        parse_cmd(tempstr);
     }
 #ifdef DGPS
-    else if (memcmp(nmea_line, "$BRD03", 6) == 0) {
+    else if (memcmp(tempstr + 3, "D03", 3) == 0) {
         parse_brd03(tempstr);
 
 #ifdef HAS_I2C_LCD
 
-        ecef_to_llh(dgps_ref_x, dgps_ref_y, dgps_ref_z,
+        /* ecef_to_llh(dgps_ref_x, dgps_ref_y, dgps_ref_z,
                     &ref_lat, &ref_lon, &ref_alt);
         char ref_lat_str[8];
         dtostrf(ref_lat, 7, 4, ref_lat_str);
@@ -2446,42 +2833,67 @@ void parseNMEA(const char* nmea_line) {
         lcd.print(" ");
         lcd.print(ref_lon_str);
 
-        //char buffer[19];
+        // char buffer[19];
         g_buff[18] = '\0';
-        const char* p = dgps_lookup(dgps_station_id);
-        
-        strncpy_P(g_buff, p, 18);
+         */
 
-        for (uint8_t i = strlen(g_buff); i < 18; i++) {
-            g_buff[i] = ' ';
-        }
-        
-        lcd.setCursor(0, 3);
-        lcd.print(g_buff);
         last_brd03_time = uptime;
 #endif
-    } else if (memcmp(nmea_line, "$BRD09", 6) == 0) {
+    } else if (memcmp(tempstr + 3, "D09", 3) == 0) {
         parse_brd09(tempstr);
-    } else if (memcmp(nmea_line, "$GPGSV", 6) == 0) {
+        dgps_last_time = uptime;
+    } else if (memcmp(tempstr + 2, "PGSV", 4) == 0) {
         parse_gsv(tempstr);
         // if (gsv_cycle_complete) {
         finalize_gsv_cycle();
         // }
-    } else if (memcmp(nmea_line, "$GPGGA", 6) == 0) {
+    } else if (memcmp(tempstr + 3, "RMC", 3) == 0) {
+        parse_rmc(tempstr);
+        // build new sentence with DGPS
+        uint8_t degrees_lat = (uint8_t)lat;
+        uint8_t minutes_lat = (uint8_t)((lat - degrees_lat) * 60);
+
+        uint8_t degrees_lon = (uint8_t)lon;
+        uint8_t minutes_lon = (uint8_t)((lon - degrees_lon) * 60);
+
+        uint32_t ssss = (((lat - degrees_lat) * 60 - minutes_lat)) * 1000000;
+        uint32_t lon_ssss = (((lon - degrees_lon) * 60 - minutes_lon)) * 1000000;
+
+        uint16_t sog_int = (uint16_t)rmc.sog;
+        uint16_t sog_dec = (uint16_t)((rmc.sog - sog_int) * 10);
+
+        uint16_t cog_int = (uint16_t)rmc.cog;
+        uint16_t cog_dec = (uint16_t)((rmc.cog - cog_int) * 10);
+
+        uint16_t mv_int = (uint16_t)rmc.mv;
+        uint16_t mv_dec = (uint16_t)((rmc.mv - mv_int) * 10);
+
+        snprintf_P(nmea_buf, sizeof(nmea_buf), PSTR("%s,%c,%02u%02u.%06lu,%c,%03u%02u.%06lu,%c,%u.%01u,%u.%01u,%s,%u.%01u,%c"), rmc.time, rmc.status, degrees_lat, minutes_lat, ssss, (lat >= 0) ? 'N' : 'S', degrees_lon, minutes_lon,
+                   lon_ssss, (lon >= 0) ? 'E' : 'W', sog_int, sog_dec, cog_int, cog_dec, rmc.date, mv_int, mv_dec, rmc.mv_direction);
+        char nmea_line[NMEA_LINE_LENGTH];
+        sprintf_P(nmea_line, PSTR("$MXRMC,%s*"), nmea_buf);
+        const uint8_t cs = calcChecksum(nmea_line);
+        sprintf_P(nmea_line, PSTR("$MXRMC,%s*%02X"), nmea_buf, cs);
+
+        // add to fifo for output
+        fifo_add(msgout_buf, nmea_line);
+        mesg_sent++;  // got one more
+    } else if (memcmp(tempstr + 2, "PGGA", 4) == 0) {
         parse_gga(tempstr);
         update_sat_validity();
         valid_sats = count_valid_sats();
+        last_sat_n_time = uptime;
         if (valid_sats >= 4) {
             compute_corrected(&lat, &lon);
         } else {
             lat = current_lat;
             lon = current_lon;
         }
-        float correction_magnitude = sqrtf(cx * cx + cy * cy);
-
+        // float correction_magnitude = sqrtf(cx * cx + cy * cy);
+        float correction_mag2 = cx * cx + cy * cy;
         float corr_score = 0.0f;
-        if (correction_magnitude > 5.0f) corr_score = 0.5f;
-        if (correction_magnitude > 15.0f) corr_score = 1.0f;
+        if (correction_mag2 > 25.0f) corr_score = 0.5f;
+        if (correction_mag2 > 225.0f) corr_score = 1.0f;
 
         float avg_snr = 0;
         int count = 0;
@@ -2526,59 +2938,82 @@ void parseNMEA(const char* nmea_line) {
         sp_add(&sp, "hdop", hdop_score, 0.15f);
         sp_add(&sp, "kf", kf_score, 0.25f);
 
-        float spoof_score = sp_final(&sp);
-
-        uint8_t spoof_flag = 0;
+        spoof_score = sp_final(&sp);
 
         if (spoof_score > 0.8f) {
             spoof_flag = 2;  // strong spoof
         } else if (spoof_score > 0.6f) {
             spoof_flag = 1;  // suspicious
+        } else {
+            spoof_flag = 0;
         }
 
         uint8_t degrees_lat = (uint8_t)lat;
         uint8_t minutes_lat = (uint8_t)((lat - degrees_lat) * 60);
-        // uint8_t seconds_lat = (uint8_t)(((lat - degrees_lat) * 60 - minutes_lat) * 60);
 
         uint8_t degrees_lon = (uint8_t)lon;
         uint8_t minutes_lon = (uint8_t)((lon - degrees_lon) * 60);
-        // uint8_t seconds_lon = (uint8_t)(((lon - degrees_lon) * 60 - minutes_lon) * 60);
-
-        static char nmea_buf[NMEA_LINE_LENGTH - 9];
-        
 
         uint32_t ssss = (((lat - degrees_lat) * 60 - minutes_lat)) * 1000000;
         uint32_t lon_ssss = (((lon - degrees_lon) * 60 - minutes_lon)) * 1000000;
         char hdop_prec[4];
         dtostrf(gga.horizontal_dilution, 3, 1, hdop_prec);
-        // char antenna_alt[5];
-        // dtostrf(gga.altitude, 4, 1, antenna_alt);
+
         int16_t antenna_int = (int16_t)gga.altitude;
         uint16_t antenna_dec = (uint16_t)((abs(gga.altitude) - abs(antenna_int)) * 10);
 
         uint16_t undulation_int = (uint16_t)gga.undulation;
         uint16_t undulation_dec = (uint16_t)((gga.undulation - undulation_int) * 10);
 
-        // uint8_t spoof_score_100 = (uint8_t)(sp_final(&sp) * 100.0f + 0.5f);
-        snprintf(nmea_buf, sizeof(nmea_buf), "%s,%02u%02u.%06lu,%c,%03u%02u.%06lu,%c,%u,%02u,%s,%d.%u,%c,%u.%u,%c,%02u,,", gga.time, degrees_lat, minutes_lat, ssss, (lat >= 0) ? 'N' : 'S', degrees_lon, minutes_lon,
-                 lon_ssss, (lon >= 0) ? 'E' : 'W', gga.fix_quality, gga.num_satellites, hdop_prec, antenna_int, antenna_dec, gga.altitude_units, undulation_int, undulation_dec, gga.undulation_units, (uint8_t)gga.dgps_age);
-        char nmea_line[NMEA_LINE_LENGTH];
-        sprintf(nmea_line, "$MXGGA,%s*", nmea_buf);
+        snprintf_P(nmea_buf, sizeof(nmea_buf), PSTR("%s,%02u%02u.%06lu,%c,%03u%02u.%06lu,%c,%u,%02u,%s,%d.%u,%c,%u.%u,%c,%02u,,"), gga.time, degrees_lat, minutes_lat, ssss, (lat >= 0) ? 'N' : 'S', degrees_lon, minutes_lon,
+                   lon_ssss, (lon >= 0) ? 'E' : 'W', gga.fix_quality, gga.num_satellites, hdop_prec, antenna_int, antenna_dec, gga.altitude_units, undulation_int, undulation_dec, gga.undulation_units, (uint8_t)gga.dgps_age);
+        static char nmea_line[NMEA_LINE_LENGTH];
+        sprintf_P(nmea_line, PSTR("$MXGGA,%s*"), nmea_buf);
         const uint8_t cs = calcChecksum(nmea_line);
-        sprintf(nmea_line, "$MXGGA,%s*%02X", nmea_buf, cs);
+        sprintf_P(nmea_line, PSTR("$MXGGA,%s*%02X"), nmea_buf, cs);
         fifo_add(msgout_buf, nmea_line);
 #ifdef HAS_I2C_LCD
-        lcd.setCursor(17, 2);
-        if (spoof_flag == 2) {
-            lcd.print("SPF");
-        } else if (spoof_flag == 1) {
-            lcd.print("SUS");
-        } else {
-            lcd.print(" OK");
-        }
-        lcd.setCursor(18, 3);
-        sprintf(g_buff, "%02u", valid_sats);
+        lcd.setCursor(10, 0);
+        int8_t lat_deg = (int8_t)lat;
+        int16_t lon_deg = (int16_t)lon;
+
+        uint8_t lat_min = abs(lat - lat_deg) * 60;
+        uint8_t lon_min = abs(lon - lon_deg) * 60;
+
+        uint8_t lat_sec = (abs(lat - lat_deg) * 60 - lat_min) * 60;
+        uint8_t lon_sec = (abs(lon - lon_deg) * 60 - lon_min) * 60;
+
+        char lat_dir = lat >= 0 ? 'N' : 'S';
+        char lon_dir = lon >= 0 ? 'E' : 'W';
+
+        sprintf_P(g_buff, PSTR("%2d\xdf%02d\x01%02d\"%c"), abs(lat_deg), lat_min, lat_sec, lat_dir);
         lcd.print(g_buff);
+        lcd.setCursor(9, 1);
+        sprintf_P(g_buff, PSTR("%3d\xdf%02d\x01%02d\"%c"), abs(lon_deg), lon_min, lon_sec, lon_dir);
+        lcd.print(g_buff);
+
+        lcd.setCursor(0, 2);
+
+        sprintf_P(g_buff, PSTR("%c%c:%c%c:%c%c"), gga.time[0], gga.time[1], gga.time[2], gga.time[3], gga.time[4], gga.time[5]);
+        lcd.print(g_buff);
+
+        if (uptime > 10) {  // Hide for 10 seconds to display startup info like IP address
+            lcd.setCursor(0, 3);
+            if (uptime - last_brd03_time > 360) {  // less than 6 minutes old
+                lcd.setCursor(0, 3);
+                lcd.print(F("DGPS data too old "));
+            } else {
+                const char* p = dgps_lookup(dgps_station_id);
+                memset(g_buff, 0, 20);
+                strcpy_P(g_buff, p);
+
+                for (uint8_t i = strlen(g_buff); i < 18; i++) {
+                    g_buff[i] = ' ';
+                }
+
+                lcd.print(g_buff);
+            }
+        }
 #endif
 #ifdef DEBUG
         char s_buf[16];
@@ -2605,21 +3040,11 @@ void parseNMEA(const char* nmea_line) {
 #endif
     }
 #endif
-    free(tempstr);
-
-#ifdef HAS_I2C_LCD
-    if (uptime - last_brd03_time > 360) {  // less than 6 minutes old
-        lcd.setCursor(0, 0);
-        lcd.print(F("NMEA MUX4s-1e       "));
-        lcd.print(BUILD, DEC);
-        lcd.setCursor(0, 3);
-        lcd.print(F("DGPS data too old "));
-        last_brd03_time = uptime;  // prevent repeated printing
-    }
-    
-#endif
 }
 
+/**
+ * Parse a parameter line of the form "key=value" and update configuration accordingly.
+ */
 void parseParameter(char* p) {
     // index search
     int8_t i = -1;
@@ -2636,11 +3061,6 @@ void parseParameter(char* p) {
     char t[k + 1];
     t[k] = 0;
     strncpy(t, p, k);
-    // ---
-
-    /*if (!(i-k)) {
-     return;
-     }*/
 
     char v[i - k + 1];
     v[i - k] = 0;
@@ -2691,8 +3111,8 @@ void parseParameter(char* p) {
                     strcpy(p_config[i].ifilter.pattern[j++], token);
                 }
             }
-            for (uint8_t a = j; a < FILTER_SIZE; a++) {
-                p_config[i].ifilter.pattern[a][0] = 0;
+            for (; j < FILTER_SIZE; j++) {
+                p_config[i].ifilter.pattern[j][0] = 0;
             }
         }
     }
@@ -2708,6 +3128,24 @@ void parseParameter(char* p) {
             char* rest = v;
             uint8_t j = 0;
 
+            /* for (uint8_t a = 0; a < FILTER_SIZE; a++) {
+                char c = 0;
+
+                for (uint8_t b = 0; b < 6; b++) {
+                    if (j == 0) {
+                        c = v[a * 7 + b];
+                        if (c == 0) {
+                            j = 1;
+                        }
+
+                        if (c == ':') {
+                            break;
+                        }
+                        p_config[i].ofilter.pattern[a][b] = c;
+                    }
+                }
+            } */
+
             while ((token = strtok_r(rest, ":", &rest))) {
                 // strcpy(v, trim(v));
                 if (!strcmp(token, "-all")) {
@@ -2720,8 +3158,8 @@ void parseParameter(char* p) {
                     strcpy(p_config[i].ofilter.pattern[j++], token);
                 }
             }
-            for (uint8_t a = j; a < FILTER_SIZE; a++) {
-                p_config[i].ofilter.pattern[a][0] = 0;
+            for (; j < FILTER_SIZE; j++) {
+                p_config[i].ofilter.pattern[j][0] = 0;
             }
         }
     }
@@ -2793,6 +3231,8 @@ void parseParameter(char* p) {
         build_available = atoi(v);
     } else if (!memcmp(t, "crc32", 5)) {
         crc_32 = hexStr2Int(v);
+    } else if (!memcmp(t, "size", 4)) {
+        filesize = atol(v);
     }
 }
 
@@ -2849,6 +3289,12 @@ void loadParamsFromEEPROM(void) {
     for (uint8_t i = 0; i < PORTS; i++) {
         eeprom_read_block((void*)&p_config[i], (const uint16_t*)c, sizeof(p_config[i]));
         c += sizeof(p_config[i]);
+#ifdef DEBUG
+        for (uint8_t a = 0; a < FILTER_SIZE; a++) {
+            sprintf_P(g_buff, txt8, i + 1, a + 1, p_config[i].ofilter.pattern[a], p_config[i].ofilter.pm_all);
+            UART0_Println(g_buff);
+        }
+#endif
     }
     eeprom_read_block((void*)&mac, (const uint16_t*)c, sizeof(mac));
     c += sizeof(mac);
@@ -2881,6 +3327,12 @@ void saveParamsToEEPROM(void) {
     uint16_t c = sizeof(uint32_t);  // skip to the next memory address
 
     for (uint8_t i = 0; i < PORTS; i++) {
+#ifdef DEBUG
+        for (uint8_t a = 0; a < FILTER_SIZE; a++) {
+            sprintf_P(g_buff, txt8, i + 1, a + 1, p_config[i].ofilter.pattern[a], p_config[i].ofilter.pm_all);
+            UART0_Println(g_buff);
+        }
+#endif
         eeprom_write_block((void*)&p_config[i], (void*)c, sizeof(p_config[i]));
         c += sizeof(p_config[i]);
     }
@@ -2920,7 +3372,11 @@ void saveParamsToEEPROM(void) {
 #endif
 }
 
+/**
+ * Connect to the MQTT broker using the configured hostname and port
+ */
 void connectMQTT(char* broker, uint16_t port) {
     mqttClient.setId(hostname);
+    mqttClient.setTimeout(5000);
     mqttClient.connect(broker, port);
 }
