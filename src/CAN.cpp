@@ -16,7 +16,7 @@ void CAN::init(uint8_t cs_pin, bool do_reset) {
 	}
 
 #if defined (__SCP) || (__AVR_ATmega32U4__ )	// 8 MHz, 250kb/s
-	CAN::writeRegister(REG_CNF1, 0x00, cs_pin);
+	CAN::writeRegister(REG_CNF1, 0x01, cs_pin);
 	CAN::writeRegister(REG_CNF2, 0xb1, cs_pin);
 	CAN::writeRegister(REG_CNF3, 0x05, cs_pin);
 #else
