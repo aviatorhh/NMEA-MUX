@@ -3,5 +3,6 @@
 #include <stdint.h>
 
 extern const uint8_t upper_min_comma[];
+extern const uint8_t stop_char[];
 
 #endif
