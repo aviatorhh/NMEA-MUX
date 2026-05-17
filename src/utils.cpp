@@ -1,8 +1,13 @@
 #include "utils.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
-#include <math.h>
+
+#define WGS84_A 6378137.0f
+#define WGS84_F 1.0f / 298.257223563f
+#define WGS84_E2 (WGS84_F * (2.0f - WGS84_F))
+
 
 char* next_field(char** p) {
     if (*p == NULL) return NULL;
@@ -42,7 +47,7 @@ char* trim(char* string) {
     while (*ptr == ' ') {
         *ptr = '\0';
         ptr--;
-    };              // overwrite with end of string
+    };  // overwrite with end of string
     return string;  // return pointer to the modified start
 }
 uint8_t checkChecksum(char* nmea_line) {
@@ -101,6 +106,36 @@ uint8_t checkChecksum(const char* nmea_line) {
         return 0;
     }
     return 1;
+}
+
+void ecef_to_llh(float x, float y, float z,
+                 float* lat, float* lon, float* alt) {
+    float lon_r = atan2f(y, x);
+
+    float p = sqrtf(x * x + y * y);
+
+    float lat_r = atan2f(z, p * (1.0f - WGS84_E2));
+
+    float prev_lat;
+
+    // iterative refinement (2–3 iterations is enough)
+    for (int i = 0; i < 3; i++) {
+        float sin_lat = sinf(lat_r);
+        float N = WGS84_A / sqrtf(1.0f - WGS84_E2 * sin_lat * sin_lat);
+
+        prev_lat = lat_r;
+        lat_r = atan2f(z + WGS84_E2 * N * sin_lat, p);
+
+        if (fabsf(lat_r - prev_lat) < 1e-10f)
+            break;
+    }
+
+    float sin_lat = sinf(lat_r);
+    float N = WGS84_A / sqrtf(1.0f - WGS84_E2 * sin_lat * sin_lat);
+
+    *alt = p / cosf(lat_r) - N;
+    *lat = lat_r * 180.0f / M_PI;
+    *lon = lon_r * 180.0f / M_PI;
 }
 
 #ifdef WEB_GUI

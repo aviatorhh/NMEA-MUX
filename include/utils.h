@@ -10,6 +10,8 @@ uint32_t hexStr2Int(char str[]);
 uint8_t checkChecksum(const char* nmea_line);
 uint8_t calcChecksum(const char* sentence);
 uint8_t checkChecksum(char* nmea_line);
+void ecef_to_llh(float x, float y, float z,
+                 float* lat, float* lon, float* alt);
 float deg2rad(float d);
 float nmea_to_deg(float nmea);
 #ifdef WEB_GUI
