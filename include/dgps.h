@@ -4,6 +4,10 @@
 #include <stdint.h>
 
 #define MAX_SIGNALS 6
+#define SAT_TIMEOUT 3   // seconds
+#define CORR_TIMEOUT 3  // seconds
+
+extern float spoof_score;
 
 typedef struct {
     uint16_t id;
@@ -45,6 +49,12 @@ typedef struct {
     float p_lat, p_lon;
     uint8_t init;
 } kf_t;
+
+
+const char* dgps_lookup(uint16_t id);
+void sp_init(spoof_score_t* sp);
+void sp_add(spoof_score_t* sp, const char* name, float value, float weight);
+float sp_final(spoof_score_t* sp);
 
 static const char s_zeven[] PROGMEM = "Zeven";
 static const char s_helgoland[] PROGMEM = "Helgoland";
@@ -506,5 +516,4 @@ const dgps_station_t dgps_table[] PROGMEM = {
 
     {986, s_cayenne},
 };
-const char* dgps_lookup(uint16_t id);
 #endif
