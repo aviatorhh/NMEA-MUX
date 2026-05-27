@@ -16,8 +16,12 @@
 #define ROWS 4
 LiquidCrystal_I2C lcd(0x27, 2, 1, 0, 4, 5, 6, 7, 3, POSITIVE);
 #endif
+#ifdef HAS_I2C_LCD
 #include "custom_chars.h"
+#endif
+#ifdef DGPS
 #include "dgps.h"
+#endif
 #include "utils.h"
 #ifdef HAS_CAN
 #include "canbus.h"
@@ -126,6 +130,7 @@ uint8_t admin_timeout;
 // volatile uint8_t zda_out_counter;
 #ifdef HAS_CAN
 CAN can(SPI_SS);
+msg_t msg;
 #endif
 
 /**
@@ -184,7 +189,6 @@ void setup() {
     crc_32_calc = 0;
     crc_32 = 0;
 #ifdef DEBUG
-
     uint16_t ubrr = (F_CPU / (DEBUG_BAUD * 8)) - 1;
     UART0_Init(ubrr);
 
@@ -193,18 +197,21 @@ void setup() {
     UART0_Flush();
 #endif
 
-    // Setup CAN interface
-#ifdef HAS_CAN
-    can.init(SPI_SS, true);
-#endif
 
     randomSeed(analogRead(0));  // init random engine
-
+#ifdef DEBUG
+    UART0_Println_P(PSTR("Random engine seeded"));
+    UART0_Flush();
+#endif
     // Some Hardware stuff
     start();
-#ifdef RESET
+#ifdef DEBUG
+    UART0_Println_P(PSTR("Hardware started"));
+    UART0_Flush();
+#endif    
+#ifdef RESET_DEVICE
     for (uint32_t i = 0; i < 4096; i++) {
-        eeprom_write_byte((uint8_t*)(i * 4), 0xffffffff);
+        eeprom_write_dword((uint32_t*)(i * 4), 0xffffffff);
     }
 #endif
 
@@ -236,7 +243,10 @@ void setup() {
     p_config[PETH1].ifilter.pm_all = 1;
     p_config[PETH1].direction = OUT;
     port1 = SERVER_PORT;
-
+#ifdef DEBUG
+    UART0_Println_P(PSTR("Port configs set to defaults"));
+    UART0_Flush();
+#endif   
     debug = 0;
     // Network settings
     ip_address[0] = ip_address[1] = ip_address[2] = ip_address[3] = 0;
@@ -247,10 +257,15 @@ void setup() {
     strcpy(hostname, HOST_NAME);
     strcpy(update_host, DEFAULT_UPDATE_HOST);
     admin_timeout = ADMIN_TIMEOUT;
-
+#ifdef DEBUG
+    UART0_Println_P(PSTR("Network settings set to defaults"));
+    UART0_Flush();
+#endif   
     uint16_t crc = eeprom_read_word(0);  // Get the CRC from EEPROM, if.
 #ifdef DEBUG
-    printsf("%x\r\n", crc);
+    sprintf(g_buff, "EEPROM CRC: %u", crc);
+    UART0_Println(g_buff);
+    UART0_Flush();
     uint8_t eeprom_data_loaded = 0;  // EEPROM data loaded flag
 #endif
 
@@ -271,7 +286,7 @@ void setup() {
 
     bool loaded_from_sd = false;
 #ifdef SDC
-    SPI.begin();
+    //SPI.begin();
     SD.begin(SD_CS);
 
     has_sd = card.init(SPI_FULL_SPEED, SD_CS);  // This flag is needed to enable or disable GUI settings.
@@ -616,6 +631,8 @@ void setup() {
 #endif
             wdt_reset();
 #endif
+
+
             if (store) {
                 saveParamsToEEPROM();
 #ifdef DEBUG
@@ -737,7 +754,27 @@ void setup() {
     const static char txt2[] PROGMEM = "EthernetServers started";
     UART0_Println_P(txt2);
 #endif
+#ifdef HAS_CAN
+    // Setup CAN interface
+DDR_SPI |= _BV(SPI_SS);  // Set CAN CS pin as output
+can.init(SPI_SS, true);  // Init CAN controller, set CS pin and set it to normal mode (false would be loopback mode for testing)
 
+    
+    msg.SID = 0x123;
+    msg.DLC = 8;
+    msg.REQ = 0;  // Data frame
+    msg.IDE = 0;  // Standard ID
+    msg.data[0] = 0xDE;
+    msg.data[1] = 0xAD;
+    msg.data[2] = 0xBE;
+    msg.data[3] = 0xEF;
+    msg.data[4] = 0xCA;
+    msg.data[5] = 0xFE;
+    msg.data[6] = 0xBA;
+    msg.data[7] = 0xBE;
+    can.sendMessage(msg, SPI_SS);
+
+#endif
 #ifdef ETHERNET
 #ifdef HAS_I2C_LCD
     show_state = 1;
@@ -1389,6 +1426,7 @@ void loop() {
     }
 
     if (static_send) {
+#ifdef HAS_I2C_LCD        
         mps_in = (mesg_recv - last_mesg_recv) / 5;
         mps_out = (mesg_sent - last_mesg_sent) / 5;
         last_mesg_recv = mesg_recv;
@@ -1420,16 +1458,19 @@ void loop() {
             has_dgps_str[2] = ' ';
             has_dgps_str[3] = ' ';
         }
+
         lcd.setCursor(8, 2);
 
         sprintf_P(g_buff, PSTR(" %s %s "), has_ap_str, has_dgps_str);
         lcd.print(g_buff);
-
+#endif
+#ifdef DGPS
         uint16_t spoof_score_int = (uint16_t)spoof_score;
         uint16_t spoof_score_dec = (uint16_t)((spoof_score - spoof_score_int) * 10);
 
         sprintf_P(g_buff, PSTR("%s,%lu,%lu,%lu,%u,%lu,%u,%u.%u"), hostname, uptime, mesg_sent, mesg_recv, dgps_station_id, (uint32_t)dgps_time_s, valid_sats, spoof_score_int, spoof_score_dec);
         sendFreeText(g_buff);
+#endif        
 #ifdef ETHERNET
         if (Ethernet.link() == 1) {
             if (mqttClient.connected()) {
@@ -1490,9 +1531,28 @@ void loop() {
 #endif
 
 #endif
+#ifdef HAS_I2C_LCD
         show_time = show_time ? 0 : 1;
         // show_state = show_state ? 0 : 1;
         show_mesg_rate = show_mesg_rate ? 0 : 1;
+#endif      
+#ifdef HAS_CAN
+
+    msg.SID = 0x123;
+    msg.DLC = 8;
+    msg.REQ = 0;  // Data frame
+    msg.IDE = 0;  // Standard ID
+    msg.data[0] = uptime & 0xFF;
+    msg.data[1] = (uptime >> 8) & 0xFF;
+    msg.data[2] = (uptime >> 16) & 0xFF;
+    msg.data[3] = (uptime >> 24) & 0xFF;
+    msg.data[4] = 0xCA;
+    msg.data[5] = 0xFE;
+    msg.data[6] = 0xBA;
+    msg.data[7] = 0xBE;
+    can.sendMessage(msg, SPI_SS);
+
+#endif  
         static_send = false;
     }
 
@@ -1643,7 +1703,7 @@ ISR(TIMER1_COMPA_vect) {
         static_send = true;
     }
 }
-
+#ifdef DGPS
 /**
  * Update the validity of the satellites based on the last GSV message and the SNR and elevation values.
  */
@@ -1668,6 +1728,7 @@ void update_sat_validity(void) {
         s->valid = 1;
     }
 }
+#endif
 /**
  * Read the bytes from a stream
  */
@@ -2560,7 +2621,7 @@ void kf_update(float lat, float lon) {
     kf.p_lon *= (1.0f - k_lon);
 }
 #endif
-
+#ifdef DGPS
 /**
  * Count the number of valid satellites
  */
@@ -2586,6 +2647,7 @@ uint8_t count_valid_sats(void) {
 
     return n;
 }
+#endif
 #ifdef TRANSLATE
 void parse_dpt(char* local) {
     // Store the original message as it will be changed bleow

@@ -134,9 +134,9 @@ extern uint8_t len; // global variable for package length
 #define DD_PORT                     PORTB
 #endif
 
-#ifndef DD_CS
-#define DD_CS   PB1
-#endif
+//#ifndef DD_CS
+//#define DD_CS   PB1
+//#endif
 
 #define CS_LOW(pin)                      DD_PORT &= ~_BV(pin);
 #define CS_HIGH(pin)                     DD_PORT |=  _BV(pin);

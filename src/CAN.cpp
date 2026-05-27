@@ -9,16 +9,19 @@ CAN::CAN(uint8_t cs_pin) {
 
 void CAN::init(uint8_t cs_pin, bool do_reset) {
 
-	// this->SPIMasterInit();
+	// SPIMasterInit();
 
 	if (do_reset) {
 		reset(cs_pin);  // coming out in config mode
 	}
 
 #if defined (__SCP) || (__AVR_ATmega32U4__ )	// 8 MHz, 250kb/s
-	CAN::writeRegister(REG_CNF1, 0x01, cs_pin);
-	CAN::writeRegister(REG_CNF2, 0xb1, cs_pin);
-	CAN::writeRegister(REG_CNF3, 0x05, cs_pin);
+	// CAN::writeRegister(REG_CNF1, 0x01, cs_pin);
+	// CAN::writeRegister(REG_CNF2, 0xb1, cs_pin);
+	// CAN::writeRegister(REG_CNF3, 0x05, cs_pin);
+    	writeRegister(REG_CNF1, 0x41, cs_pin);
+	writeRegister(REG_CNF2, 0xfb, cs_pin);
+	writeRegister(REG_CNF3, 0x46, cs_pin);
 #else
 
 #if F_CPU == 20000000
@@ -185,7 +188,7 @@ void CAN::reset(uint8_t cs_pin) {
 	CS_LOW(cs_pin);
 	CAN::SPIMasterTransmit(RESET);
 	CS_HIGH(cs_pin);
-	_delay_ms(50); // Just in case
+	//_delay_ms(50); // Just in case
 }
 
 void CAN::sendMessageWait(msg_t& msg, const uint8_t tx_buffer, const uint8_t cs_pin) {
